@@ -1,4 +1,5 @@
 from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox
+from qgis.PyQt.QtGui import QIcon
 from qgis.core import QgsProject, Qgis, QgsVectorLayer
 from .liste_pbo_dialog import ListePBODialog
 import os
@@ -12,12 +13,14 @@ class ListePBOPlugin:
         self.action = None
 
     def initGui(self):
+        icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
         self.action = QAction(
-            "Generer LISTE DES PBO",
+            QIcon(icon_path),
+            "NGE RIP34",
             self.iface.mainWindow()
         )
         self.action.setToolTip(
-            "v3 - LISTE_DES_PBO.txt avec BPE de depart"
+            "NGE RIP34 - Outils FTTH"
         )
         self.action.triggered.connect(self.run)
         self.iface.addToolBarIcon(self.action)

@@ -9,6 +9,6 @@ email=pbirau@nge-es.fr
 about=Plugin v3 avec affichage hierarchique. Detecte le BPE de depart via la couche CB (cables DISTRIBUTION), auto-coche le parent quand un PBO enfant est selectionne. Genere LISTE_DES_PBO.txt avec PBO + BPE de depart.
 tags=ftth,bpe,pbo,rip34,nge
 category=Analysis
-icon=
+icon=icon.png
 experimental=False
 deprecated=False
