@@ -113,28 +113,68 @@ class ListePBOPlugin:
             }
             bpe_types[code] = type_fonc
 
-        # Construire le graphe cable : extremite -> origine
-        # (uniquement cables DISTRIBUTION, pas RACCORDEMENT)
+        # Auto-detecter les noms de colonnes CB
+        # (match par substring pour gerer espaces,
+        #  BOM, troncatures DBF, etc.)
         cb_fields = [f.name() for f in cb_layer.fields()]
-        has_cb_type = "type_fonc" in cb_fields
+
+        def find_col(fields, patterns):
+            """Cherche une colonne dont le nom contient
+            un des patterns (insensible a la casse)."""
+            for f in fields:
+                fl = f.lower().strip()
+                for p in patterns:
+                    if p in fl:
+                        return f
+            return None
+
+        col_orig = find_col(
+            cb_fields, ["origine", "origin"]
+        )
+        col_extr = find_col(
+            cb_fields, ["extremite", "extremit", "extr"]
+        )
+
+        if not col_orig or not col_extr:
+            QMessageBox.warning(
+                self.iface.mainWindow(), "Erreur",
+                "Colonnes origine/extremite non trouvees "
+                "dans la couche CB.\n\n"
+                "Colonnes disponibles (" + str(
+                    len(cb_fields)
+                ) + ") :\n"
+                + "\n".join(
+                    repr(f) for f in cb_fields
+                )
+            )
+            return
+
+        col_cb_type = find_col(
+            cb_fields, ["type_fonc", "type_fon"]
+        )
+        col_cap = find_col(
+            cb_fields, ["capacite", "capacit"]
+        )
+
+        # Construire le graphe cable : extremite -> origine
         cables_to = {}  # extremite -> origine
         for feat in cb_layer.getFeatures():
-            # Filtrer RACCORDEMENT si la colonne existe
-            if has_cb_type:
-                cb_type = str(feat["type_fonc"]).strip().upper()
+            # Filtrer RACCORDEMENT
+            if col_cb_type:
+                cb_type = str(
+                    feat[col_cb_type]
+                ).strip().upper()
                 if cb_type == "RACCORDEMENT":
                     continue
-            else:
-                # Pas de colonne type_fonc : filtrer par
-                # capacite (1 FO = raccordement)
+            elif col_cap:
                 try:
-                    cap = int(feat["capacite"])
+                    cap = int(feat[col_cap])
                     if cap <= 1:
                         continue
                 except Exception:
                     pass
-            orig = str(feat["origine"]).strip()
-            extr = str(feat["extremite"]).strip()
+            orig = str(feat[col_orig]).strip()
+            extr = str(feat[col_extr]).strip()
             if orig and extr and orig != "NULL":
                 cables_to[extr] = orig
 
