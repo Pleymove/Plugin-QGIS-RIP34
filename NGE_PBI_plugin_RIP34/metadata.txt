@@ -2,8 +2,8 @@
 name=NGE_PBI_plugin_RIP34
 qgisMinimumVersion=3.0
 qgisMaximumVersion=4.99
-description=Genere le fichier LISTE DES PBO.txt avec affichage hierarchique BPE depart / PBO
-version=3.2
+description=Plugin couteau suisse FTTH RIP34 : generation LISTE DES PBO + calcul fibres utiles avec MAJ automatique de la table attributaire CB
+version=4.0
 author=Pierre Birau / NGE Energie & Solutions
 email=pbirau@nge-es.fr
 about=Plugin v3 avec affichage hierarchique. Detecte le BPE de depart via la couche CB (cables DISTRIBUTION), auto-coche le parent quand un PBO enfant est selectionne. Genere LISTE_DES_PBO.txt avec PBO + BPE de depart.
