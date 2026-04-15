@@ -561,9 +561,18 @@ class ListePBOPlugin:
             )
             return
 
-        # 7. Ouvrir la fenetre de resultats
+        # 7. Recuperer les codes CB selectionnes sur la carte
+        selected_codes = set()
+        for feat in cb_layer.selectedFeatures():
+            if col_code_cb:
+                v = str(feat[col_code_cb]).strip()
+                if v and v != "NULL":
+                    selected_codes.add(v)
+
+        # 8. Ouvrir la fenetre de resultats
         dlg = FibresUtilesDialog(
             modifications, total_cables,
+            selected_codes,
             self.iface.mainWindow()
         )
         if not dlg.exec():
