@@ -1,5 +1,5 @@
 from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox
-from qgis.core import QgsProject, Qgis
+from qgis.core import QgsProject, Qgis, QgsVectorLayer
 from .liste_pbo_dialog import ListePBODialog
 import os
 
@@ -53,6 +53,10 @@ class ListePBOPlugin:
         cb_layer = None
 
         for layer in layers:
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+            if not layer.isValid():
+                continue
             name = layer.name().upper()
             if name.endswith("_BPE"):
                 bpe_layer = layer
