@@ -1,5 +1,5 @@
 [general]
-name=NGE_PBI_plugin_RIP34_V1
+name=NGE_PBI_plugin_RIP34
 qgisMinimumVersion=3.0
 qgisMaximumVersion=4.99
 description=Genere le fichier LISTE DES PBO.txt avec affichage hierarchique BPE depart / PBO

@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <plugins>
-<pyqgis_plugin name="NGE_PBI_plugin_RIP34_V1" version="3.1">
+<pyqgis_plugin name="NGE_PBI_plugin_RIP34" version="3.1">
 <description>Genere LISTE DES PBO.txt avec hierarchie BPE depart / PBO</description>
 <about>Plugin v3 avec affichage hierarchique. Detecte le BPE de depart via la couche CB.</about>
 <version>3.1</version>
@@ -8,8 +8,8 @@
 <qgis_maximum_version>4.99</qgis_maximum_version>
 <author_name>Pierre Birau / NGE Energie et Solutions</author_name>
 <email>pbirau@nge-es.fr</email>
-<download_url>https://github.com/Pleymove/Plugin-QGIS-RIP34/releases/download/v3.1/NGE_PBI_plugin_RIP34_V1.zip</download_url>
-<file_name>NGE_PBI_plugin_RIP34_V1.zip</file_name>
+<download_url>https://github.com/Pleymove/Plugin-QGIS-RIP34/releases/download/v3.1/NGE_PBI_plugin_RIP34.zip</download_url>
+<file_name>NGE_PBI_plugin_RIP34.zip</file_name>
 <tags>ftth,bpe,pbo,rip34,nge</tags>
 </pyqgis_plugin>
 </plugins>
