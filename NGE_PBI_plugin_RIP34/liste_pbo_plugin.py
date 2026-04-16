@@ -68,11 +68,11 @@ class ListePBOPlugin:
         return None  # securite anti-boucle
 
     def run(self):
-        # Chercher les couches BPE, ST et CB
+        # Chercher les couches BPE, ST et CB (multi-SRO)
         layers = QgsProject.instance().mapLayers().values()
-        bpe_layer = None
-        st_layer = None
-        cb_layer = None
+        bpe_layers = []
+        st_layers = []
+        cb_layers = []
 
         for layer in layers:
             if not isinstance(layer, QgsVectorLayer):
@@ -81,25 +81,25 @@ class ListePBOPlugin:
                 continue
             name = layer.name().upper()
             if name.endswith("_BPE"):
-                bpe_layer = layer
+                bpe_layers.append(layer)
             elif name.endswith("_ST"):
-                st_layer = layer
+                st_layers.append(layer)
             elif name.endswith("_CB"):
-                cb_layer = layer
+                cb_layers.append(layer)
 
-        if not bpe_layer:
+        if not bpe_layers:
             QMessageBox.warning(
                 self.iface.mainWindow(), "Erreur",
                 "Aucune couche *_BPE trouvee."
             )
             return
-        if not st_layer:
+        if not st_layers:
             QMessageBox.warning(
                 self.iface.mainWindow(), "Erreur",
                 "Aucune couche *_ST trouvee."
             )
             return
-        if not cb_layer:
+        if not cb_layers:
             QMessageBox.warning(
                 self.iface.mainWindow(), "Erreur",
                 "Aucune couche *_CB trouvee.\n"
@@ -109,40 +109,43 @@ class ListePBOPlugin:
 
         # BPE selectionnes sur la carte
         selected_codes = set()
-        for feat in bpe_layer.selectedFeatures():
-            selected_codes.add(
-                str(feat["code_bpe"]).strip()
-            )
+        for bpe_l in bpe_layers:
+            for feat in bpe_l.selectedFeatures():
+                selected_codes.add(
+                    str(feat["code_bpe"]).strip()
+                )
 
         # Compter les BAT par BPE
         bpe_bats = {}
-        for feat in st_layer.getFeatures():
-            bpe_code = str(feat["code_bpe"]).strip()
-            if bpe_code not in bpe_bats:
-                bpe_bats[bpe_code] = 0
-            bpe_bats[bpe_code] = bpe_bats[bpe_code] + 1
+        for st_l in st_layers:
+            for feat in st_l.getFeatures():
+                bpe_code = str(feat["code_bpe"]).strip()
+                if bpe_code not in bpe_bats:
+                    bpe_bats[bpe_code] = 0
+                bpe_bats[bpe_code] = bpe_bats[bpe_code] + 1
 
         # Construire donnees BPE
         bpe_data = {}
         bpe_types = {}  # code -> type_fonc brut
 
-        for feat in bpe_layer.getFeatures():
-            code = str(feat["code_bpe"]).strip()
-            type_fonc = str(feat["type_fonc"]).strip()
-            if "PBO" in type_fonc.upper():
-                bpe_type = "PBO"
-            else:
-                bpe_type = "BPE"
-            nb = bpe_bats.get(code, 0)
-            bpe_data[code] = {
-                "type": bpe_type, "nb_bats": nb
-            }
-            bpe_types[code] = type_fonc
+        for bpe_l in bpe_layers:
+            for feat in bpe_l.getFeatures():
+                code = str(feat["code_bpe"]).strip()
+                type_fonc = str(feat["type_fonc"]).strip()
+                if "PBO" in type_fonc.upper():
+                    bpe_type = "PBO"
+                else:
+                    bpe_type = "BPE"
+                nb = bpe_bats.get(code, 0)
+                bpe_data[code] = {
+                    "type": bpe_type, "nb_bats": nb
+                }
+                bpe_types[code] = type_fonc
 
         # Auto-detecter les noms de colonnes CB
         # (match par substring pour gerer espaces,
         #  BOM, troncatures DBF, etc.)
-        cb_fields = [f.name() for f in cb_layer.fields()]
+        cb_fields = [f.name() for f in cb_layers[0].fields()]
 
         def find_col(fields, patterns):
             """Cherche une colonne dont le nom contient
@@ -184,25 +187,26 @@ class ListePBOPlugin:
 
         # Construire le graphe cable : extremite -> origine
         cables_to = {}  # extremite -> origine
-        for feat in cb_layer.getFeatures():
-            # Filtrer RACCORDEMENT
-            if col_cb_type:
-                cb_type = str(
-                    feat[col_cb_type]
-                ).strip().upper()
-                if cb_type == "RACCORDEMENT":
-                    continue
-            elif col_cap:
-                try:
-                    cap = int(feat[col_cap])
-                    if cap <= 1:
+        for cb_l in cb_layers:
+            for feat in cb_l.getFeatures():
+                # Filtrer RACCORDEMENT
+                if col_cb_type:
+                    cb_type = str(
+                        feat[col_cb_type]
+                    ).strip().upper()
+                    if cb_type == "RACCORDEMENT":
                         continue
-                except Exception:
-                    pass
-            orig = str(feat[col_orig]).strip()
-            extr = str(feat[col_extr]).strip()
-            if orig and extr and orig != "NULL":
-                cables_to[extr] = orig
+                elif col_cap:
+                    try:
+                        cap = int(feat[col_cap])
+                        if cap <= 1:
+                            continue
+                    except Exception:
+                        pass
+                orig = str(feat[col_orig]).strip()
+                extr = str(feat[col_extr]).strip()
+                if orig and extr and orig != "NULL":
+                    cables_to[extr] = orig
 
         # Pour chaque PBO, trouver son BPE de depart
         # en remontant les cables
@@ -249,7 +253,7 @@ class ListePBOPlugin:
         # Dossier de sortie
         dossier = QgsProject.instance().absolutePath()
         if not dossier:
-            source = bpe_layer.source()
+            source = bpe_layers[0].source()
             if source:
                 dossier = os.path.dirname(source)
         if not dossier or not os.path.isdir(dossier):
@@ -269,11 +273,12 @@ class ListePBOPlugin:
                 "bats": []
             }
 
-        for feat in st_layer.getFeatures():
-            bpe_code = str(feat["code_bpe"]).strip()
-            if bpe_code in chosen_set:
-                bat = str(feat["code_st"]).strip()
-                bpe_output[bpe_code]["bats"].append(bat)
+        for st_l in st_layers:
+            for feat in st_l.getFeatures():
+                bpe_code = str(feat["code_bpe"]).strip()
+                if bpe_code in chosen_set:
+                    bat = str(feat["code_st"]).strip()
+                    bpe_output[bpe_code]["bats"].append(bat)
 
         # Organiser : BPE de depart -> PBO enfants
         parents_in_output = set()
@@ -365,11 +370,11 @@ class ListePBOPlugin:
 
     def run_fibres(self):
         """Calcule les fibres utiles sur les cables DISTRIBUTION."""
-        # 1. Charger les couches
+        # 1. Charger les couches (multi-SRO)
         layers = QgsProject.instance().mapLayers().values()
-        bpe_layer = None
-        st_layer = None
-        cb_layer = None
+        bpe_layers = []
+        st_layers = []
+        cb_layers = []
 
         for layer in layers:
             if not isinstance(layer, QgsVectorLayer):
@@ -378,32 +383,36 @@ class ListePBOPlugin:
                 continue
             name = layer.name().upper()
             if name.endswith("_BPE"):
-                bpe_layer = layer
+                bpe_layers.append(layer)
             elif name.endswith("_ST"):
-                st_layer = layer
+                st_layers.append(layer)
             elif name.endswith("_CB"):
-                cb_layer = layer
+                cb_layers.append(layer)
 
-        if not cb_layer:
+        if not cb_layers:
             QMessageBox.warning(
                 self.iface.mainWindow(), "Erreur",
                 "Aucune couche *_CB trouvee."
             )
             return
 
-        # 1b. Selection obligatoire
-        if cb_layer.selectedFeatureCount() == 0:
+        # 1b. Selection obligatoire (toutes couches CB)
+        total_selected = sum(
+            l.selectedFeatureCount() for l in cb_layers
+        )
+        if total_selected == 0:
+            cb_names = ", ".join(l.name() for l in cb_layers)
             QMessageBox.information(
                 self.iface.mainWindow(), "Fibres Utiles",
                 "Veuillez d'abord selectionner au moins un cable\n"
-                "dans la couche " + cb_layer.name()
-                + " sur la carte,\n"
+                "dans une couche CB (" + cb_names
+                + ") sur la carte,\n"
                 "puis relancer le calcul."
             )
             return
 
         # 2. Detecter les colonnes CB
-        cb_fields = [f.name() for f in cb_layer.fields()]
+        cb_fields = [f.name() for f in cb_layers[0].fields()]
 
         def find_col(fields, patterns):
             for f in fields:
@@ -444,15 +453,18 @@ class ListePBOPlugin:
             cb_fields, ["code_cb", "code_cable"]
         )
 
-        # FID des cables selectionnes sur la carte
-        selected_fids = set(
-            f.id() for f in cb_layer.selectedFeatures()
-        )
+        # FID des cables selectionnes + mapping vers leur couche
+        selected_fids = set()
+        fid_to_cb_layer = {}
+        for cb_l in cb_layers:
+            for feat in cb_l.selectedFeatures():
+                selected_fids.add(feat.id())
+                fid_to_cb_layer[feat.id()] = cb_l
 
         # 3. Compter les BAT par BPE (depuis couche ST)
         bpe_bats = {}
-        if st_layer:
-            for feat in st_layer.getFeatures():
+        for st_l in st_layers:
+            for feat in st_l.getFeatures():
                 bpe_code = str(feat["code_bpe"]).strip()
                 bpe_bats[bpe_code] = (
                     bpe_bats.get(bpe_code, 0) + 1
@@ -463,57 +475,59 @@ class ListePBOPlugin:
         children = {}
         cables_feats = []
 
-        for feat in cb_layer.getFeatures():
-            # Filtrer RACCORDEMENT
-            is_raccord = False
-            if col_cb_type:
-                cb_type = str(
-                    feat[col_cb_type]
-                ).strip().upper()
-                if cb_type == "RACCORDEMENT":
-                    is_raccord = True
-            elif col_cap:
-                try:
-                    cap = int(feat[col_cap])
-                    if cap <= 1:
+        for cb_l in cb_layers:
+            for feat in cb_l.getFeatures():
+                # Filtrer RACCORDEMENT
+                is_raccord = False
+                if col_cb_type:
+                    cb_type = str(
+                        feat[col_cb_type]
+                    ).strip().upper()
+                    if cb_type == "RACCORDEMENT":
                         is_raccord = True
-                except Exception:
-                    pass
+                elif col_cap:
+                    try:
+                        cap = int(feat[col_cap])
+                        if cap <= 1:
+                            is_raccord = True
+                    except Exception:
+                        pass
 
-            if is_raccord:
-                continue
+                if is_raccord:
+                    continue
 
-            orig = str(feat[col_orig]).strip()
-            extr = str(feat[col_extr]).strip()
-            if not orig or not extr or orig == "NULL":
-                continue
+                orig = str(feat[col_orig]).strip()
+                extr = str(feat[col_extr]).strip()
+                if not orig or not extr or orig == "NULL":
+                    continue
 
-            fid = feat.id()
-            code_cb = (
-                str(feat[col_code_cb]).strip()
-                if col_code_cb
-                else "FID_" + str(fid)
-            )
-
-            fibre_u_actuel = None
-            if col_fibre_u:
-                try:
-                    v = feat[col_fibre_u]
-                    if v is not None and str(
-                        v
-                    ).strip() not in ("", "NULL"):
-                        fibre_u_actuel = int(v)
-                except Exception:
-                    pass
-
-            if orig not in children:
-                children[orig] = []
-            children[orig].append(extr)
-
-            if fid in selected_fids:
-                cables_feats.append(
-                    (fid, code_cb, orig, extr, fibre_u_actuel)
+                fid = feat.id()
+                code_cb = (
+                    str(feat[col_code_cb]).strip()
+                    if col_code_cb
+                    else "FID_" + str(fid)
                 )
+
+                fibre_u_actuel = None
+                if col_fibre_u:
+                    try:
+                        v = feat[col_fibre_u]
+                        if v is not None and str(
+                            v
+                        ).strip() not in ("", "NULL"):
+                            fibre_u_actuel = int(v)
+                    except Exception:
+                        pass
+
+                if orig not in children:
+                    children[orig] = []
+                children[orig].append(extr)
+
+                if fid in selected_fids:
+                    cables_feats.append(
+                        (fid, code_cb, orig, extr,
+                         fibre_u_actuel)
+                    )
 
         if not cables_feats:
             QMessageBox.information(
@@ -581,7 +595,8 @@ class ListePBOPlugin:
         dlg = FibresUtilesDialog(
             modifications, len(cables_feats),
             iface=self.iface,
-            cb_layer=cb_layer,
+            cb_layer=cb_layers[0],
+            fid_to_layer=fid_to_cb_layer,
             parent=self.iface.mainWindow()
         )
         if not dlg.exec():
@@ -613,14 +628,24 @@ class ListePBOPlugin:
             )
             return
 
-        # 8. Appliquer les modifications dans la couche CB
-        idx_fu = cb_layer.fields().indexOf(col_fibre_u)
-        cb_layer.startEditing()
-        nb_modif = 0
+        # 8. Appliquer les modifications par couche CB source
+        by_layer = {}
         for fid, new_val in chosen:
-            cb_layer.changeAttributeValue(fid, idx_fu, new_val)
-            nb_modif = nb_modif + 1
-        cb_layer.commitChanges()
+            lyr = fid_to_cb_layer.get(fid, cb_layers[0])
+            if lyr not in by_layer:
+                by_layer[lyr] = []
+            by_layer[lyr].append((fid, new_val))
+
+        nb_modif = 0
+        for lyr, changes in by_layer.items():
+            idx_fu = lyr.fields().indexOf(col_fibre_u)
+            lyr.startEditing()
+            for fid, new_val in changes:
+                lyr.changeAttributeValue(
+                    fid, idx_fu, new_val
+                )
+                nb_modif = nb_modif + 1
+            lyr.commitChanges()
 
         self.iface.messageBar().pushMessage(
             "Fibres Utiles",
@@ -634,13 +659,13 @@ class ListePBOPlugin:
         avec la couche ft_appui Orange.
         Convention : ORA_{num_appui}-{code_commu}
         """
-        # 1. Trouver les 3 couches
+        # 1. Trouver les couches (multi-SRO)
         layers = list(
             QgsProject.instance().mapLayers().values()
         )
-        cb_layer = None
-        ch_layer = None
-        ft_appui_layer = None
+        cb_layers = []
+        ch_layers = []
+        ft_appui_layers = []
 
         for layer in layers:
             if not isinstance(layer, QgsVectorLayer):
@@ -651,25 +676,25 @@ class ListePBOPlugin:
             name_up = name.upper()
             name_lo = name.lower()
             if name_up.endswith("_CB"):
-                cb_layer = layer
+                cb_layers.append(layer)
             elif name_up.endswith("_CH"):
-                ch_layer = layer
+                ch_layers.append(layer)
             elif "ft_appui" in name_lo:
-                ft_appui_layer = layer
+                ft_appui_layers.append(layer)
 
-        if not cb_layer:
+        if not cb_layers:
             QMessageBox.warning(
                 self.iface.mainWindow(), "Erreur",
                 "Aucune couche *_CB trouvee."
             )
             return
-        if not ch_layer:
+        if not ch_layers:
             QMessageBox.warning(
                 self.iface.mainWindow(), "Erreur",
                 "Aucune couche *_CH trouvee."
             )
             return
-        if not ft_appui_layer:
+        if not ft_appui_layers:
             QMessageBox.warning(
                 self.iface.mainWindow(), "Erreur",
                 "Aucune couche ft_appui trouvee.\n"
@@ -677,14 +702,18 @@ class ListePBOPlugin:
             )
             return
 
-        # 2. Selection obligatoire sur CB
-        if cb_layer.selectedFeatureCount() == 0:
+        # 2. Selection obligatoire sur CB (toutes couches)
+        total_selected = sum(
+            l.selectedFeatureCount() for l in cb_layers
+        )
+        if total_selected == 0:
+            cb_names = ", ".join(l.name() for l in cb_layers)
             QMessageBox.information(
                 self.iface.mainWindow(), "REF PROP",
                 "Veuillez d'abord selectionner au moins "
-                "un cable\ndans la couche "
-                + cb_layer.name()
-                + " sur la carte,\npuis relancer l'outil."
+                "un cable\ndans une couche CB ("
+                + cb_names
+                + ") sur la carte,\npuis relancer l'outil."
             )
             return
 
@@ -697,7 +726,7 @@ class ListePBOPlugin:
                         return f
             return None
 
-        ch_fields = [f.name() for f in ch_layer.fields()]
+        ch_fields = [f.name() for f in ch_layers[0].fields()]
         col_ref_prop = find_col(
             ch_fields, ["ref_prop", "ref prop", "refprop"]
         )
@@ -710,7 +739,7 @@ class ListePBOPlugin:
             return
 
         ft_fields = [
-            f.name() for f in ft_appui_layer.fields()
+            f.name() for f in ft_appui_layers[0].fields()
         ]
         col_num_appui = find_col(
             ft_fields, ["num_appui", "num appui"]
@@ -730,49 +759,63 @@ class ListePBOPlugin:
 
         # Reprojection : tout en CRS de CB (reference commune)
         project_instance = QgsProject.instance()
-        cb_crs = cb_layer.crs()
+        cb_crs = cb_layers[0].crs()
 
-        ch_to_cb = None
-        if ch_layer.crs() != cb_crs:
-            ch_to_cb = QgsCoordinateTransform(
-                ch_layer.crs(), cb_crs, project_instance
-            )
-        ft_to_cb = None
-        if ft_appui_layer.crs() != cb_crs:
-            ft_to_cb = QgsCoordinateTransform(
-                ft_appui_layer.crs(), cb_crs, project_instance
-            )
+        # Transforms par couche CH et ft_appui
+        ch_transforms = {}
+        for ch_l in ch_layers:
+            if ch_l.crs() != cb_crs:
+                ch_transforms[ch_l.id()] = (
+                    QgsCoordinateTransform(
+                        ch_l.crs(), cb_crs, project_instance
+                    )
+                )
+        ft_transforms = {}
+        for ft_l in ft_appui_layers:
+            if ft_l.crs() != cb_crs:
+                ft_transforms[ft_l.id()] = (
+                    QgsCoordinateTransform(
+                        ft_l.crs(), cb_crs, project_instance
+                    )
+                )
 
         # 4. Index spatial ft_appui (geometries en CRS CB)
         ft_index = QgsSpatialIndex()
         ft_features = {}
         ft_geoms = {}
-        for feat in ft_appui_layer.getFeatures():
-            geom = QgsGeometry(feat.geometry())
-            if ft_to_cb:
-                geom.transform(ft_to_cb)
-            idx_feat = QgsFeature(feat.id())
-            idx_feat.setGeometry(geom)
-            ft_index.addFeature(idx_feat)
-            ft_features[feat.id()] = feat
-            ft_geoms[feat.id()] = geom
+        for ft_l in ft_appui_layers:
+            ft_tr = ft_transforms.get(ft_l.id())
+            for feat in ft_l.getFeatures():
+                geom = QgsGeometry(feat.geometry())
+                if ft_tr:
+                    geom.transform(ft_tr)
+                idx_feat = QgsFeature(feat.id())
+                idx_feat.setGeometry(geom)
+                ft_index.addFeature(idx_feat)
+                ft_features[feat.id()] = feat
+                ft_geoms[feat.id()] = geom
 
         # 5. Charger les appuis CH (geometries en CRS CB)
         ch_features = {}
         ch_geoms = {}
-        for feat in ch_layer.getFeatures():
-            geom = QgsGeometry(feat.geometry())
-            if ch_to_cb:
-                geom.transform(ch_to_cb)
-            ch_features[feat.id()] = feat
-            ch_geoms[feat.id()] = geom
+        ch_fid_to_layer = {}
+        for ch_l in ch_layers:
+            ch_tr = ch_transforms.get(ch_l.id())
+            for feat in ch_l.getFeatures():
+                geom = QgsGeometry(feat.geometry())
+                if ch_tr:
+                    geom.transform(ch_tr)
+                ch_features[feat.id()] = feat
+                ch_geoms[feat.id()] = geom
+                ch_fid_to_layer[feat.id()] = ch_l
 
         # 6. Collecter les geometries des cables selectionnes
         selected_cable_geoms = []
-        for feat in cb_layer.selectedFeatures():
-            g = feat.geometry()
-            if not g.isEmpty():
-                selected_cable_geoms.append(g)
+        for cb_l in cb_layers:
+            for feat in cb_l.selectedFeatures():
+                g = feat.geometry()
+                if not g.isEmpty():
+                    selected_cable_geoms.append(g)
 
         if not selected_cable_geoms:
             QMessageBox.warning(
@@ -857,7 +900,8 @@ class ListePBOPlugin:
         dlg = RefPropDialog(
             modifications,
             iface=self.iface,
-            ch_layer=ch_layer,
+            ch_layer=ch_layers[0],
+            ch_fid_to_layer=ch_fid_to_layer,
             parent=self.iface.mainWindow()
         )
         if not dlg.exec():
@@ -882,13 +926,21 @@ class ListePBOPlugin:
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        idx = ch_layer.fields().indexOf(col_ref_prop)
-        ch_layer.startEditing()
+        by_layer = {}
         for ch_fid, ref_prop_val in chosen:
-            ch_layer.changeAttributeValue(
-                ch_fid, idx, ref_prop_val
-            )
-        ch_layer.commitChanges()
+            lyr = ch_fid_to_layer.get(ch_fid, ch_layers[0])
+            if lyr not in by_layer:
+                by_layer[lyr] = []
+            by_layer[lyr].append((ch_fid, ref_prop_val))
+
+        for lyr, changes in by_layer.items():
+            idx = lyr.fields().indexOf(col_ref_prop)
+            lyr.startEditing()
+            for ch_fid, ref_prop_val in changes:
+                lyr.changeAttributeValue(
+                    ch_fid, idx, ref_prop_val
+                )
+            lyr.commitChanges()
 
         self.iface.messageBar().pushMessage(
             "REF PROP",
