@@ -757,87 +757,92 @@ class ListePBOPlugin:
             ft_features[feat.id()] = feat
             ft_geoms[feat.id()] = geom
 
-        # 5. Index spatial ch_layer (geometries en CRS CB)
-        ch_index = QgsSpatialIndex()
+        # 5. Charger les appuis CH (geometries en CRS CB)
         ch_features = {}
         ch_geoms = {}
         for feat in ch_layer.getFeatures():
             geom = QgsGeometry(feat.geometry())
             if ch_to_cb:
                 geom.transform(ch_to_cb)
-            idx_feat = QgsFeature(feat.id())
-            idx_feat.setGeometry(geom)
-            ch_index.addFeature(idx_feat)
             ch_features[feat.id()] = feat
             ch_geoms[feat.id()] = geom
 
-        # 6. Pour chaque cable selectionne, trouver les
-        #    appuis CH dans un buffer de 5 m (CRS CB),
-        #    puis matcher avec ft_appui (seuil 5 m)
-        # best_match : ch_fid -> {distance, ref_prop, ...}
-        best_match = {}
+        # 6. Collecter les geometries des cables selectionnes
+        selected_cable_geoms = []
+        for feat in cb_layer.selectedFeatures():
+            g = feat.geometry()
+            if not g.isEmpty():
+                selected_cable_geoms.append(g)
 
-        for cable_feat in cb_layer.selectedFeatures():
-            cable_geom = cable_feat.geometry()
-            if cable_geom.isEmpty():
+        if not selected_cable_geoms:
+            QMessageBox.warning(
+                self.iface.mainWindow(), "REF PROP",
+                "Aucun cable selectionne avec geometrie valide."
+            )
+            return
+
+        SEUIL_CABLE = 10.0   # metres : appui CH sur/pres du cable
+        SEUIL_FT = 15.0      # metres : tolerance appui Orange vs CH
+
+        # 7. Pour chaque appui CH, distance min aux cables
+        #    selectionnes (tout en CRS CB)
+        modifications = {}
+        for ch_fid, ch_geom in ch_geoms.items():
+            min_dist_cable = min(
+                ch_geom.distance(cg)
+                for cg in selected_cable_geoms
+            )
+            if min_dist_cable > SEUIL_CABLE:
                 continue
-            buffer_geom = cable_geom.buffer(5, 5)
-            bbox = buffer_geom.boundingBox()
 
-            for ch_fid in ch_index.intersects(bbox):
-                ch_feat = ch_features.get(ch_fid)
-                ch_geom = ch_geoms.get(ch_fid)
-                if not ch_feat or not ch_geom:
-                    continue
-                if not buffer_geom.intersects(ch_geom):
-                    continue
+            # Appui proche d'un cable : chercher ft_appui voisin
+            nearest = ft_index.nearestNeighbor(
+                ch_geom.asPoint(), 1
+            )
+            if not nearest:
+                continue
+            ft_fid = nearest[0]
+            ft_geom = ft_geoms.get(ft_fid)
+            ft_data = ft_features.get(ft_fid)
+            if not ft_geom or not ft_data:
+                continue
+            dist_ft = ch_geom.distance(ft_geom)
+            if dist_ft > SEUIL_FT:
+                continue
 
-                # Chercher l'appui Orange le plus proche
-                nearest = ft_index.nearestNeighbor(
-                    ch_geom.asPoint(), 1
-                )
-                if not nearest:
-                    continue
-                ft_feat = ft_features.get(nearest[0])
-                ft_geom = ft_geoms.get(nearest[0])
-                if not ft_feat or not ft_geom:
-                    continue
-                dist = ch_geom.distance(ft_geom)
-                if dist > 5.0:
-                    continue
+            num_appui = str(int(str(
+                ft_data[col_num_appui]
+            ).strip()))
+            code_commu = str(
+                ft_data[col_code_commu]
+            ).strip()
+            ref_prop_new = (
+                "ORA_" + num_appui + "-" + code_commu
+            )
 
-                num_appui = str(int(str(
-                    ft_feat[col_num_appui]
-                ).strip()))
-                code_commu = str(
-                    ft_feat[col_code_commu]
-                ).strip()
-                ref_prop = (
-                    "ORA_" + num_appui + "-" + code_commu
-                )
+            ch_data = ch_features[ch_fid]
+            actuel_raw = ch_data[col_ref_prop]
+            actuel = (
+                str(actuel_raw).strip()
+                if actuel_raw is not None
+                and str(actuel_raw).strip()
+                not in ("", "NULL", "None")
+                else ""
+            )
 
-                # Dédupliquer : garder le match le + proche
-                if ch_fid not in best_match or (
-                    dist < best_match[ch_fid]["distance"]
-                ):
-                    actuel_raw = ch_feat[col_ref_prop]
-                    actuel = (
-                        str(actuel_raw).strip()
-                        if actuel_raw is not None
-                        and str(actuel_raw).strip()
-                        not in ("", "NULL")
-                        else ""
-                    )
-                    best_match[ch_fid] = {
-                        "ch_fid": ch_fid,
-                        "ref_prop": ref_prop,
-                        "num_appui": num_appui,
-                        "code_commu": code_commu,
-                        "distance": round(dist, 2),
-                        "actuel": actuel,
-                    }
+            if ch_fid not in modifications or (
+                dist_ft < modifications[ch_fid]["distance"]
+            ):
+                modifications[ch_fid] = {
+                    "ch_fid": ch_fid,
+                    "ref_prop": ref_prop_new,
+                    "num_appui": num_appui,
+                    "code_commu": code_commu,
+                    "distance": round(dist_ft, 2),
+                    "actuel": actuel,
+                }
 
-        modifications = list(best_match.values())
+        modifications = list(modifications.values())
         modifications.sort(key=lambda x: x["distance"])
 
         # 7. Ouvrir le dialog
