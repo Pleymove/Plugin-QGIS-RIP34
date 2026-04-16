@@ -738,6 +738,8 @@ class ListePBOPlugin:
             )
             return
 
+        col_type_struc = find_col(ch_fields, ["type_struc"])
+
         ft_fields = [
             f.name() for f in ft_appui_layers[0].fields()
         ]
@@ -795,13 +797,19 @@ class ListePBOPlugin:
                 ft_features[feat.id()] = feat
                 ft_geoms[feat.id()] = geom
 
-        # 5. Charger les appuis CH (geometries en CRS CB)
+        # 5. Charger les appuis CH POTEAUX uniquement (CRS CB)
         ch_features = {}
         ch_geoms = {}
         ch_fid_to_layer = {}
         for ch_l in ch_layers:
             ch_tr = ch_transforms.get(ch_l.id())
             for feat in ch_l.getFeatures():
+                if col_type_struc:
+                    type_struc = str(
+                        feat[col_type_struc]
+                    ).strip().upper()
+                    if type_struc != "POTEAU":
+                        continue
                 geom = QgsGeometry(feat.geometry())
                 if ch_tr:
                     geom.transform(ch_tr)
