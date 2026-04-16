@@ -36,12 +36,14 @@ class FibresUtilesDialog(QDialog):
     """
 
     def __init__(self, modifications, total_selected,
-                 iface=None, cb_layer=None, parent=None):
+                 iface=None, cb_layer=None,
+                 fid_to_layer=None, parent=None):
         super().__init__(parent)
         self.modifications = modifications
         self.total_selected = total_selected
         self.iface = iface
         self.cb_layer = cb_layer
+        self.fid_to_layer = fid_to_layer or {}
         self.setWindowTitle(
             "Calcul Fibres Utiles — "
             + str(total_selected)
@@ -239,17 +241,18 @@ class FibresUtilesDialog(QDialog):
     # Double-clic : zoom + flash sur la carte
     # ------------------------------------------------------------------
     def on_double_click(self, row, col):
-        if not self.iface or not self.cb_layer:
+        if not self.iface:
             return
         cb_item = self.table.item(row, 0)
         if not cb_item:
             return
         fid = cb_item.data(_R_FID)
-        self.cb_layer.selectByIds([fid])
-        self.iface.mapCanvas().zoomToSelected(self.cb_layer)
-        self.iface.mapCanvas().flashFeatureIds(
-            self.cb_layer, [fid]
-        )
+        layer = self.fid_to_layer.get(fid, self.cb_layer)
+        if not layer:
+            return
+        layer.selectByIds([fid])
+        self.iface.mapCanvas().zoomToSelected(layer)
+        self.iface.mapCanvas().flashFeatureIds(layer, [fid])
 
     # ------------------------------------------------------------------
     # Sélection groupée (respecte la visibilité du filtre)

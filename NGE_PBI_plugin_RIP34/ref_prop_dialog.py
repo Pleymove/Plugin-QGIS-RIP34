@@ -34,11 +34,13 @@ class RefPropDialog(QDialog):
     """
 
     def __init__(self, modifications, iface=None,
-                 ch_layer=None, parent=None):
+                 ch_layer=None, ch_fid_to_layer=None,
+                 parent=None):
         super().__init__(parent)
         self.modifications = modifications
         self.iface = iface
         self.ch_layer = ch_layer
+        self.ch_fid_to_layer = ch_fid_to_layer or {}
         self.setWindowTitle(
             "Remplir REF PROP — "
             + str(len(modifications))
@@ -212,16 +214,21 @@ class RefPropDialog(QDialog):
     # Double-clic : zoom + flash sur l'appui CH
     # ------------------------------------------------------------------
     def on_double_click(self, row, col):
-        if not self.iface or not self.ch_layer:
+        if not self.iface:
             return
         item = self.table.item(row, 0)
         if not item:
             return
         ch_fid = item.data(_R_FID)
-        self.ch_layer.selectByIds([ch_fid])
-        self.iface.mapCanvas().zoomToSelected(self.ch_layer)
+        layer = self.ch_fid_to_layer.get(
+            ch_fid, self.ch_layer
+        )
+        if not layer:
+            return
+        layer.selectByIds([ch_fid])
+        self.iface.mapCanvas().zoomToSelected(layer)
         self.iface.mapCanvas().flashFeatureIds(
-            self.ch_layer, [ch_fid]
+            layer, [ch_fid]
         )
 
     # ------------------------------------------------------------------
