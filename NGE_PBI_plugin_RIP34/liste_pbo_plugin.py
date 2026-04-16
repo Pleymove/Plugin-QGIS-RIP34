@@ -3,7 +3,8 @@ from qgis.PyQt.QtWidgets import (QAction, QFileDialog, QMessageBox,
 from qgis.PyQt.QtGui import QIcon, QCursor
 from qgis.core import (QgsProject, Qgis, QgsVectorLayer,
                        QgsSpatialIndex, QgsFeatureRequest,
-                       QgsGeometry)
+                       QgsGeometry, QgsFeature,
+                       QgsCoordinateTransform)
 from .liste_pbo_dialog import ListePBODialog
 from .fibres_utiles_dialog import FibresUtilesDialog
 from .ref_prop_dialog import RefPropDialog
@@ -727,23 +728,52 @@ class ListePBOPlugin:
             )
             return
 
-        # 4. Index spatial ft_appui
-        ft_index = QgsSpatialIndex(
-            ft_appui_layer.getFeatures()
-        )
-        ft_features = {}
-        for feat in ft_appui_layer.getFeatures():
-            ft_features[feat.id()] = feat
+        # Reprojection : tout en CRS de CB (reference commune)
+        project_instance = QgsProject.instance()
+        cb_crs = cb_layer.crs()
 
-        # 5. Index spatial ch_layer
-        ch_index = QgsSpatialIndex(ch_layer.getFeatures())
+        ch_to_cb = None
+        if ch_layer.crs() != cb_crs:
+            ch_to_cb = QgsCoordinateTransform(
+                ch_layer.crs(), cb_crs, project_instance
+            )
+        ft_to_cb = None
+        if ft_appui_layer.crs() != cb_crs:
+            ft_to_cb = QgsCoordinateTransform(
+                ft_appui_layer.crs(), cb_crs, project_instance
+            )
+
+        # 4. Index spatial ft_appui (geometries en CRS CB)
+        ft_index = QgsSpatialIndex()
+        ft_features = {}
+        ft_geoms = {}
+        for feat in ft_appui_layer.getFeatures():
+            geom = QgsGeometry(feat.geometry())
+            if ft_to_cb:
+                geom.transform(ft_to_cb)
+            idx_feat = QgsFeature(feat.id())
+            idx_feat.setGeometry(geom)
+            ft_index.addFeature(idx_feat)
+            ft_features[feat.id()] = feat
+            ft_geoms[feat.id()] = geom
+
+        # 5. Index spatial ch_layer (geometries en CRS CB)
+        ch_index = QgsSpatialIndex()
         ch_features = {}
+        ch_geoms = {}
         for feat in ch_layer.getFeatures():
+            geom = QgsGeometry(feat.geometry())
+            if ch_to_cb:
+                geom.transform(ch_to_cb)
+            idx_feat = QgsFeature(feat.id())
+            idx_feat.setGeometry(geom)
+            ch_index.addFeature(idx_feat)
             ch_features[feat.id()] = feat
+            ch_geoms[feat.id()] = geom
 
         # 6. Pour chaque cable selectionne, trouver les
-        #    appuis CH dans un buffer de 2 m, puis
-        #    matcher avec ft_appui (seuil 5 m)
+        #    appuis CH dans un buffer de 5 m (CRS CB),
+        #    puis matcher avec ft_appui (seuil 5 m)
         # best_match : ch_fid -> {distance, ref_prop, ...}
         best_match = {}
 
@@ -751,30 +781,28 @@ class ListePBOPlugin:
             cable_geom = cable_feat.geometry()
             if cable_geom.isEmpty():
                 continue
-            buffer_geom = cable_geom.buffer(2, 5)
+            buffer_geom = cable_geom.buffer(5, 5)
             bbox = buffer_geom.boundingBox()
 
             for ch_fid in ch_index.intersects(bbox):
                 ch_feat = ch_features.get(ch_fid)
-                if not ch_feat:
+                ch_geom = ch_geoms.get(ch_fid)
+                if not ch_feat or not ch_geom:
                     continue
-                if not buffer_geom.intersects(
-                    ch_feat.geometry()
-                ):
+                if not buffer_geom.intersects(ch_geom):
                     continue
 
                 # Chercher l'appui Orange le plus proche
                 nearest = ft_index.nearestNeighbor(
-                    ch_feat.geometry().asPoint(), 1
+                    ch_geom.asPoint(), 1
                 )
                 if not nearest:
                     continue
                 ft_feat = ft_features.get(nearest[0])
-                if not ft_feat:
+                ft_geom = ft_geoms.get(nearest[0])
+                if not ft_feat or not ft_geom:
                     continue
-                dist = ch_feat.geometry().distance(
-                    ft_feat.geometry()
-                )
+                dist = ch_geom.distance(ft_geom)
                 if dist > 5.0:
                     continue
 
