@@ -1,9 +1,12 @@
 from qgis.PyQt.QtWidgets import (QAction, QFileDialog, QMessageBox,
                                   QMenu)
 from qgis.PyQt.QtGui import QIcon, QCursor
-from qgis.core import QgsProject, Qgis, QgsVectorLayer
+from qgis.core import (QgsProject, Qgis, QgsVectorLayer,
+                       QgsSpatialIndex, QgsFeatureRequest,
+                       QgsGeometry)
 from .liste_pbo_dialog import ListePBODialog
 from .fibres_utiles_dialog import FibresUtilesDialog
+from .ref_prop_dialog import RefPropDialog
 import os
 import math
 
@@ -39,6 +42,10 @@ class ListePBOPlugin:
         act_pbo.triggered.connect(self.run)
         act_fibres = menu.addAction("Calculer Fibres Utiles")
         act_fibres.triggered.connect(self.run_fibres)
+        act_ref = menu.addAction(
+            "Remplir REF PROP (appuis Orange)"
+        )
+        act_ref.triggered.connect(self.run_ref_prop)
         menu.exec(QCursor.pos())
 
     def find_parent(self, pbo_code, cables_to, bpe_types,
@@ -618,5 +625,241 @@ class ListePBOPlugin:
             "Fibres Utiles",
             str(nb_modif)
             + " cable(s) mis a jour dans la couche CB.",
+            level=Qgis.Success, duration=10
+        )
+
+    def run_ref_prop(self):
+        """Remplit REF_PROP des appuis CH via match spatial
+        avec la couche ft_appui Orange.
+        Convention : ORA_{num_appui}-{code_commu}
+        """
+        # 1. Trouver les 3 couches
+        layers = list(
+            QgsProject.instance().mapLayers().values()
+        )
+        cb_layer = None
+        ch_layer = None
+        ft_appui_layer = None
+
+        for layer in layers:
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+            if not layer.isValid():
+                continue
+            name = layer.name()
+            name_up = name.upper()
+            name_lo = name.lower()
+            if name_up.endswith("_CB"):
+                cb_layer = layer
+            elif name_up.endswith("_CH"):
+                ch_layer = layer
+            elif "ft_appui" in name_lo:
+                ft_appui_layer = layer
+
+        if not cb_layer:
+            QMessageBox.warning(
+                self.iface.mainWindow(), "Erreur",
+                "Aucune couche *_CB trouvee."
+            )
+            return
+        if not ch_layer:
+            QMessageBox.warning(
+                self.iface.mainWindow(), "Erreur",
+                "Aucune couche *_CH trouvee."
+            )
+            return
+        if not ft_appui_layer:
+            QMessageBox.warning(
+                self.iface.mainWindow(), "Erreur",
+                "Aucune couche ft_appui trouvee.\n"
+                "(cherche 'ft_appui' dans le nom de couche)"
+            )
+            return
+
+        # 2. Selection obligatoire sur CB
+        if cb_layer.selectedFeatureCount() == 0:
+            QMessageBox.information(
+                self.iface.mainWindow(), "REF PROP",
+                "Veuillez d'abord selectionner au moins "
+                "un cable\ndans la couche "
+                + cb_layer.name()
+                + " sur la carte,\npuis relancer l'outil."
+            )
+            return
+
+        # 3. Detecter les colonnes
+        def find_col(fields, patterns):
+            for f in fields:
+                fl = f.lower().strip()
+                for p in patterns:
+                    if p in fl:
+                        return f
+            return None
+
+        ch_fields = [f.name() for f in ch_layer.fields()]
+        col_ref_prop = find_col(
+            ch_fields, ["ref_prop", "ref prop", "refprop"]
+        )
+        if not col_ref_prop:
+            QMessageBox.warning(
+                self.iface.mainWindow(), "Erreur",
+                "Colonne ref_prop introuvable dans *_CH.\n"
+                "Colonnes : " + ", ".join(ch_fields)
+            )
+            return
+
+        ft_fields = [
+            f.name() for f in ft_appui_layer.fields()
+        ]
+        col_num_appui = find_col(
+            ft_fields, ["num_appui", "num appui"]
+        )
+        col_code_commu = find_col(
+            ft_fields,
+            ["code_commu", "code_comm", "code_insee"]
+        )
+        if not col_num_appui or not col_code_commu:
+            QMessageBox.warning(
+                self.iface.mainWindow(), "Erreur",
+                "Colonnes num_appui / code_commu introuvables"
+                " dans la couche ft_appui.\n"
+                "Colonnes : " + ", ".join(ft_fields)
+            )
+            return
+
+        # 4. Index spatial ft_appui
+        ft_index = QgsSpatialIndex(
+            ft_appui_layer.getFeatures()
+        )
+        ft_features = {}
+        for feat in ft_appui_layer.getFeatures():
+            ft_features[feat.id()] = feat
+
+        # 5. Index spatial ch_layer
+        ch_index = QgsSpatialIndex(ch_layer.getFeatures())
+        ch_features = {}
+        for feat in ch_layer.getFeatures():
+            ch_features[feat.id()] = feat
+
+        # 6. Pour chaque cable selectionne, trouver les
+        #    appuis CH dans un buffer de 2 m, puis
+        #    matcher avec ft_appui (seuil 5 m)
+        # best_match : ch_fid -> {distance, ref_prop, ...}
+        best_match = {}
+
+        for cable_feat in cb_layer.selectedFeatures():
+            cable_geom = cable_feat.geometry()
+            if cable_geom.isEmpty():
+                continue
+            buffer_geom = cable_geom.buffer(2, 5)
+            bbox = buffer_geom.boundingBox()
+
+            for ch_fid in ch_index.intersects(bbox):
+                ch_feat = ch_features.get(ch_fid)
+                if not ch_feat:
+                    continue
+                if not buffer_geom.intersects(
+                    ch_feat.geometry()
+                ):
+                    continue
+
+                # Chercher l'appui Orange le plus proche
+                nearest = ft_index.nearestNeighbor(
+                    ch_feat.geometry().asPoint(), 1
+                )
+                if not nearest:
+                    continue
+                ft_feat = ft_features.get(nearest[0])
+                if not ft_feat:
+                    continue
+                dist = ch_feat.geometry().distance(
+                    ft_feat.geometry()
+                )
+                if dist > 5.0:
+                    continue
+
+                num_appui = str(
+                    ft_feat[col_num_appui]
+                ).strip()
+                code_commu = str(
+                    ft_feat[col_code_commu]
+                ).strip()
+                ref_prop = (
+                    "ORA_" + num_appui + "-" + code_commu
+                )
+
+                # Dédupliquer : garder le match le + proche
+                if ch_fid not in best_match or (
+                    dist < best_match[ch_fid]["distance"]
+                ):
+                    actuel_raw = ch_feat[col_ref_prop]
+                    actuel = (
+                        str(actuel_raw).strip()
+                        if actuel_raw is not None
+                        and str(actuel_raw).strip()
+                        not in ("", "NULL")
+                        else ""
+                    )
+                    best_match[ch_fid] = {
+                        "ch_fid": ch_fid,
+                        "ref_prop": ref_prop,
+                        "num_appui": num_appui,
+                        "code_commu": code_commu,
+                        "distance": round(dist, 2),
+                        "actuel": actuel,
+                    }
+
+        modifications = list(best_match.values())
+        modifications.sort(key=lambda x: x["distance"])
+
+        # 7. Ouvrir le dialog
+        if not modifications:
+            QMessageBox.information(
+                self.iface.mainWindow(), "REF PROP",
+                "Aucun appui a mettre a jour sur les "
+                "cables selectionnes."
+            )
+            return
+
+        dlg = RefPropDialog(
+            modifications,
+            iface=self.iface,
+            ch_layer=ch_layer,
+            parent=self.iface.mainWindow()
+        )
+        if not dlg.exec():
+            return
+
+        # 8. Appliquer
+        chosen = dlg.get_chosen()
+        if not chosen:
+            self.iface.messageBar().pushMessage(
+                "REF PROP", "Aucun appui selectionne.",
+                level=Qgis.Warning, duration=5
+            )
+            return
+
+        reply = QMessageBox.question(
+            self.iface.mainWindow(), "Confirmation",
+            "Remplir REF_PROP pour "
+            + str(len(chosen)) + " appui(s) ?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        idx = ch_layer.fields().indexOf(col_ref_prop)
+        ch_layer.startEditing()
+        for ch_fid, ref_prop_val in chosen:
+            ch_layer.changeAttributeValue(
+                ch_fid, idx, ref_prop_val
+            )
+        ch_layer.commitChanges()
+
+        self.iface.messageBar().pushMessage(
+            "REF PROP",
+            str(len(chosen))
+            + " appui(s) REF_PROP mis a jour.",
             level=Qgis.Success, duration=10
         )
