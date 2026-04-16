@@ -132,6 +132,7 @@ class RefPropDialog(QDialog):
                 else Qt.CheckState.Checked
             )
             cb_item.setBackground(QBrush(bg))
+            cb_item.setForeground(QBrush(QColor("black")))
             cb_item.setData(_R_FID, ch_fid)
             cb_item.setData(_R_REF, ref_prop)
             cb_item.setData(_R_OK, already_ok)
@@ -155,6 +156,7 @@ class RefPropDialog(QDialog):
                     item.flags() & ~Qt.ItemFlag.ItemIsEditable
                 )
                 item.setBackground(QBrush(bg))
+                item.setForeground(QBrush(QColor("black")))
                 self.table.setItem(row, col, item)
 
         self.table.setSortingEnabled(True)
