@@ -778,9 +778,9 @@ class ListePBOPlugin:
                 if dist > 5.0:
                     continue
 
-                num_appui = str(
+                num_appui = str(int(str(
                     ft_feat[col_num_appui]
-                ).strip()
+                ).strip()))
                 code_commu = str(
                     ft_feat[col_code_commu]
                 ).strip()
