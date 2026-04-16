@@ -383,6 +383,17 @@ class ListePBOPlugin:
             )
             return
 
+        # 1b. Selection obligatoire
+        if cb_layer.selectedFeatureCount() == 0:
+            QMessageBox.information(
+                self.iface.mainWindow(), "Fibres Utiles",
+                "Veuillez d'abord selectionner au moins un cable\n"
+                "dans la couche " + cb_layer.name()
+                + " sur la carte,\n"
+                "puis relancer le calcul."
+            )
+            return
+
         # 2. Detecter les colonnes CB
         cb_fields = [f.name() for f in cb_layer.fields()]
 
@@ -423,6 +434,11 @@ class ListePBOPlugin:
         )
         col_code_cb = find_col(
             cb_fields, ["code_cb", "code_cable"]
+        )
+
+        # FID des cables selectionnes sur la carte
+        selected_fids = set(
+            f.id() for f in cb_layer.selectedFeatures()
         )
 
         # 3. Compter les BAT par BPE (depuis couche ST)
@@ -486,9 +502,10 @@ class ListePBOPlugin:
                 children[orig] = []
             children[orig].append(extr)
 
-            cables_feats.append(
-                (fid, code_cb, orig, extr, fibre_u_actuel)
-            )
+            if fid in selected_fids:
+                cables_feats.append(
+                    (fid, code_cb, orig, extr, fibre_u_actuel)
+                )
 
         if not cables_feats:
             QMessageBox.information(
@@ -536,44 +553,28 @@ class ListePBOPlugin:
                 ecart = abs(capacite_proposee - fibre_u_actuel)
                 sous_dim = capacite_proposee > fibre_u_actuel
 
-            if ecart > 0:
-                modifications.append({
-                    "fid": fid,
-                    "code": code_cb,
-                    "fu": fu,
-                    "actuel": fibre_u_actuel,
-                    "propose": capacite_proposee,
-                    "ecart": ecart,
-                    "sous_dim": sous_dim,
-                })
+            modifications.append({
+                "fid": fid,
+                "code": code_cb,
+                "fu": fu,
+                "actuel": fibre_u_actuel,
+                "propose": capacite_proposee,
+                "ecart": ecart,
+                "sous_dim": sous_dim,
+                "ok": ecart == 0,
+            })
 
         # Trier par ecart decroissant
         modifications.sort(
             key=lambda x: x["ecart"], reverse=True
         )
 
-        if not modifications:
-            QMessageBox.information(
-                self.iface.mainWindow(), "Fibres Utiles",
-                "Aucune modification proposee.\n"
-                "Tous les " + str(total_cables)
-                + " cables sont correctement dimensionnes."
-            )
-            return
-
-        # 7. Recuperer les codes CB selectionnes sur la carte
-        selected_codes = set()
-        for feat in cb_layer.selectedFeatures():
-            if col_code_cb:
-                v = str(feat[col_code_cb]).strip()
-                if v and v != "NULL":
-                    selected_codes.add(v)
-
-        # 8. Ouvrir la fenetre de resultats
+        # 7. Ouvrir la fenetre de resultats
         dlg = FibresUtilesDialog(
-            modifications, total_cables,
-            selected_codes,
-            self.iface.mainWindow()
+            modifications, len(cables_feats),
+            iface=self.iface,
+            cb_layer=cb_layer,
+            parent=self.iface.mainWindow()
         )
         if not dlg.exec():
             return
@@ -584,6 +585,16 @@ class ListePBOPlugin:
                 "Fibres Utiles", "Aucun cable selectionne.",
                 level=Qgis.Warning, duration=5
             )
+            return
+
+        reply = QMessageBox.question(
+            self.iface.mainWindow(), "Confirmation",
+            "Modifier fibre_u pour "
+            + str(len(chosen)) + " cable(s) ?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         if not col_fibre_u:
