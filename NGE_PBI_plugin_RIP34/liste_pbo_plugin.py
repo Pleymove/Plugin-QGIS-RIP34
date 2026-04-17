@@ -8,8 +8,11 @@ from qgis.core import (QgsProject, Qgis, QgsVectorLayer,
 from .liste_pbo_dialog import ListePBODialog
 from .fibres_utiles_dialog import FibresUtilesDialog
 from .ref_prop_dialog import RefPropDialog
+from .renommage_apd_dialog import RenommageAPDDialog
 import os
 import math
+import re
+import shutil
 
 
 class ListePBOPlugin:
@@ -47,6 +50,10 @@ class ListePBOPlugin:
             "Remplir REF PROP (appuis Orange)"
         )
         act_ref.triggered.connect(self.run_ref_prop)
+        act_rename = menu.addAction(
+            "Renommer APS \u2192 APD"
+        )
+        act_rename.triggered.connect(self.run_renommage_apd)
         menu.exec(QCursor.pos())
 
     def find_parent(self, pbo_code, cables_to, bpe_types,
@@ -955,4 +962,173 @@ class ListePBOPlugin:
             str(len(chosen))
             + " appui(s) REF_PROP mis a jour.",
             level=Qgis.Success, duration=10
+        )
+
+    def run_renommage_apd(self):
+        """Renomme les couches APS -> APD dans QGIS
+        et sur le disque (shapefile).
+        """
+        # 1. Scanner les couches dont le nom contient "-APS-"
+        candidates = []
+        for layer in (
+            QgsProject.instance().mapLayers().values()
+        ):
+            name = layer.name()
+            if re.search(r"-APS-", name, re.IGNORECASE):
+                new_name = re.sub(
+                    r"-APS-", "-APD-", name,
+                    flags=re.IGNORECASE
+                )
+                candidates.append({
+                    "layer": layer,
+                    "old_name": name,
+                    "new_name": new_name,
+                })
+
+        if not candidates:
+            QMessageBox.information(
+                self.iface.mainWindow(),
+                "Renommage APS \u2192 APD",
+                "Aucune couche contenant '-APS-' "
+                "trouvee dans le projet."
+            )
+            return
+
+        # 2. Ouvrir le dialog de selection
+        dlg = RenommageAPDDialog(
+            candidates, self.iface.mainWindow()
+        )
+        if not dlg.exec():
+            return
+
+        chosen = dlg.get_chosen()
+        if not chosen:
+            self.iface.messageBar().pushMessage(
+                "Renommage APS \u2192 APD",
+                "Aucune couche selectionnee.",
+                level=Qgis.Warning, duration=5
+            )
+            return
+
+        # 3. Confirmation (operation irreversible)
+        reply = QMessageBox.question(
+            self.iface.mainWindow(), "Confirmation",
+            "Renommer " + str(len(chosen))
+            + " couche(s) APS \u2192 APD ?\n\n"
+            "Cette operation renomme les fichiers "
+            "sur le disque et est irreversible.",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # 4. Appliquer le renommage
+        nb_ok = 0
+        nb_err = 0
+        SHP_EXTS = [
+            ".shp", ".shx", ".dbf", ".prj",
+            ".cpg", ".qix", ".qpj", ".sbn", ".sbx",
+        ]
+
+        for item in chosen:
+            layer = item["layer"]
+            old_name = item["old_name"]
+            new_name = item["new_name"]
+
+            # Extraire le chemin source (avant '|' eventuel)
+            source = layer.source().split("|")[0].strip()
+            is_shp = source.lower().endswith(".shp")
+
+            if not is_shp:
+                # Format non-shapefile : renommage QGIS seul
+                layer.setName(new_name)
+                nb_ok += 1
+                continue
+
+            dir_path = os.path.dirname(source)
+            old_stem = os.path.splitext(
+                os.path.basename(source)
+            )[0]
+            new_stem = re.sub(
+                r"-APS-", "-APD-", old_stem,
+                flags=re.IGNORECASE
+            )
+
+            if old_stem == new_stem:
+                # Le nom de fichier ne contient pas -APS-
+                # (nom QGIS seul change)
+                layer.setName(new_name)
+                nb_ok += 1
+                continue
+
+            new_shp = os.path.join(
+                dir_path, new_stem + ".shp"
+            )
+            if os.path.exists(new_shp):
+                QMessageBox.warning(
+                    self.iface.mainWindow(),
+                    "Renommage APS \u2192 APD",
+                    "Fichier deja existant, couche ignoree :\n"
+                    + new_shp
+                )
+                nb_err += 1
+                continue
+
+            # Renommer tous les fichiers associes
+            try:
+                for ext in SHP_EXTS:
+                    old_f = os.path.join(
+                        dir_path, old_stem + ext
+                    )
+                    if os.path.exists(old_f):
+                        shutil.move(
+                            old_f,
+                            os.path.join(
+                                dir_path, new_stem + ext
+                            )
+                        )
+            except OSError as e:
+                QMessageBox.warning(
+                    self.iface.mainWindow(),
+                    "Renommage APS \u2192 APD",
+                    "Erreur fichier pour '"
+                    + old_name + "' :\n" + str(e)
+                )
+                nb_err += 1
+                continue
+
+            # Supprimer l'ancienne couche et recharger
+            QgsProject.instance().removeMapLayer(
+                layer.id()
+            )
+            new_layer = QgsVectorLayer(
+                new_shp, new_name, "ogr"
+            )
+            if new_layer.isValid():
+                QgsProject.instance().addMapLayer(
+                    new_layer
+                )
+                nb_ok += 1
+            else:
+                QMessageBox.warning(
+                    self.iface.mainWindow(),
+                    "Renommage APS \u2192 APD",
+                    "Couche rechargee invalide : "
+                    + new_name
+                )
+                nb_err += 1
+
+        # 5. Message de resultat
+        msg = str(nb_ok) + " couche(s) renommee(s)."
+        if nb_err:
+            msg += " " + str(nb_err) + " erreur(s)."
+        self.iface.messageBar().pushMessage(
+            "Renommage APS \u2192 APD",
+            msg,
+            level=(
+                Qgis.Success if nb_ok > 0
+                else Qgis.Warning
+            ),
+            duration=10
         )
