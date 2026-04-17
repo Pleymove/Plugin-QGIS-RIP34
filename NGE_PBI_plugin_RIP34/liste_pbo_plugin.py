@@ -1,15 +1,22 @@
 from qgis.PyQt.QtWidgets import (QAction, QFileDialog, QMessageBox,
-                                  QMenu)
+                                  QMenu, QProgressDialog)
 from qgis.PyQt.QtGui import QIcon, QCursor
+from qgis.PyQt.QtCore import Qt, QCoreApplication
 from qgis.core import (QgsProject, Qgis, QgsVectorLayer,
                        QgsSpatialIndex, QgsFeatureRequest,
                        QgsGeometry, QgsFeature,
-                       QgsCoordinateTransform)
+                       QgsCoordinateTransform,
+                       QgsApplication, QgsMessageLog)
 from .liste_pbo_dialog import ListePBODialog
 from .fibres_utiles_dialog import FibresUtilesDialog
 from .ref_prop_dialog import RefPropDialog
+from .renommage_apd_dialog import RenommageAPDDialog
 import os
 import math
+import re
+import gc
+import time
+import shutil
 
 
 class ListePBOPlugin:
@@ -47,6 +54,10 @@ class ListePBOPlugin:
             "Remplir REF PROP (appuis Orange)"
         )
         act_ref.triggered.connect(self.run_ref_prop)
+        act_rename = menu.addAction(
+            "Renommer APS \u2192 APD"
+        )
+        act_rename.triggered.connect(self.run_renommage_apd)
         menu.exec(QCursor.pos())
 
     def find_parent(self, pbo_code, cables_to, bpe_types,
@@ -955,4 +966,606 @@ class ListePBOPlugin:
             str(len(chosen))
             + " appui(s) REF_PROP mis a jour.",
             level=Qgis.Success, duration=10
+        )
+
+    def run_renommage_apd(self):
+        """Renomme les couches APS -> APD dans QGIS
+        et sur le disque (shapefile).
+        """
+        # 1. Scanner les couches dont le nom contient "-APS-"
+        candidates = []
+        for layer in (
+            QgsProject.instance().mapLayers().values()
+        ):
+            name = layer.name()
+            if re.search(r"-APS-", name, re.IGNORECASE):
+                new_name = re.sub(
+                    r"-APS-", "-APD-", name,
+                    flags=re.IGNORECASE
+                )
+                candidates.append({
+                    "layer": layer,
+                    "old_name": name,
+                    "new_name": new_name,
+                })
+
+        if not candidates:
+            QMessageBox.information(
+                self.iface.mainWindow(),
+                "Renommage APS \u2192 APD",
+                "Aucune couche contenant '-APS-' "
+                "trouvee dans le projet."
+            )
+            return
+
+        # 2. Ouvrir le dialog de selection
+        dlg = RenommageAPDDialog(
+            candidates, self.iface.mainWindow()
+        )
+        if not dlg.exec():
+            return
+
+        chosen = dlg.get_chosen()
+        if not chosen:
+            self.iface.messageBar().pushMessage(
+                "Renommage APS \u2192 APD",
+                "Aucune couche selectionnee.",
+                level=Qgis.Warning, duration=5
+            )
+            return
+
+        # 3. Confirmation (operation irreversible)
+        reply = QMessageBox.question(
+            self.iface.mainWindow(), "Confirmation",
+            "Renommer " + str(len(chosen))
+            + " couche(s) APS \u2192 APD ?\n\n"
+            "Cette operation renomme les fichiers "
+            "sur le disque et est irreversible.",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        LOG_TAG = "Renommage APD"
+
+        # Phase A : validation / collecte des jobs shapefile
+        nb_renomme = 0
+        erreurs = []
+        jobs = []
+
+        for item in chosen:
+            layer = item["layer"]
+            old_name = item["old_name"]
+            new_name = item["new_name"]
+
+            source = layer.source().split("|")[0].strip()
+            is_shp = source.lower().endswith(".shp")
+
+            if not is_shp:
+                # Format non-shapefile : renommage QGIS seul
+                layer.setName(new_name)
+                nb_renomme += 1
+                continue
+
+            dir_path = os.path.dirname(source)
+            old_stem = os.path.splitext(
+                os.path.basename(source)
+            )[0]
+            new_stem = re.sub(
+                r"-APS-", "-APD-", old_stem,
+                flags=re.IGNORECASE
+            )
+
+            if old_stem == new_stem:
+                # Nom de fichier sans -APS- : renommage QGIS seul
+                layer.setName(new_name)
+                nb_renomme += 1
+                continue
+
+            new_shp = os.path.join(
+                dir_path, new_stem + ".shp"
+            )
+
+            # Scan dossier : tous les fichiers avec basename exact
+            try:
+                matching_files = [
+                    f for f in os.listdir(dir_path)
+                    if os.path.splitext(f)[0] == old_stem
+                ]
+            except OSError as e:
+                erreurs.append(
+                    "Erreur lecture dossier pour "
+                    + old_stem + " : " + str(e)
+                )
+                continue
+
+            if not matching_files:
+                erreurs.append(
+                    "Aucun fichier trouve pour " + old_stem
+                )
+                continue
+
+            jobs.append({
+                "layer": layer,
+                "old_name": old_name,
+                "new_name": new_name,
+                "old_source_path": source,
+                "new_source_path": new_shp,
+                "folder": dir_path,
+                "old_prefix": old_stem,
+                "new_prefix": new_stem,
+                "matching_files": matching_files,
+            })
+
+        # STRATEGIE : COPY + RELOAD + DELETE best-effort.
+        # os.rename echoue systematiquement sur les .dbf a cause
+        # des handles GDAL/OGR gardes en cache meme apres
+        # removeMapLayer. shutil.copy2 ne requiert qu'un acces
+        # LECTURE PARTAGEE sur la source, ce qui reste autorise
+        # meme si QGIS / Defender / indexer ont un handle ouvert.
+        # On copie vers le nouveau nom, on recharge la couche sur
+        # le nouveau chemin, puis on supprime les anciens fichiers
+        # via force_release_and_delete (qui purge le cache GDAL
+        # avant chaque tentative).
+
+        # Helper : force GDAL a relacher tout handle cache sur
+        # le path puis supprime le fichier. Retry avec backoff
+        # exponentiel. Renvoie True si supprime, False sinon.
+        def force_release_and_delete(path, retries=6):
+            try:
+                from osgeo import gdal, ogr
+            except ImportError:
+                gdal = None
+                ogr = None
+
+            backoff = [0.2, 0.4, 0.8, 1.6, 3.2, 6.4]
+            for attempt in range(retries + 1):
+                # Force GDAL/OGR a fermer tout dataset cache
+                if ogr is not None:
+                    try:
+                        ds = ogr.Open(path)
+                        ds = None
+                    except Exception:
+                        pass
+                if gdal is not None:
+                    try:
+                        gdal.SetCacheMax(0)
+                        gdal.SetCacheMax(64 * 1024 * 1024)
+                    except Exception:
+                        pass
+                gc.collect()
+                try:
+                    os.remove(path)
+                    return True
+                except OSError as e:
+                    if attempt < retries:
+                        delay = backoff[
+                            min(attempt, len(backoff) - 1)
+                        ]
+                        QgsMessageLog.logMessage(
+                            "Delete retry "
+                            + str(attempt + 2) + "/"
+                            + str(retries + 1)
+                            + " sur "
+                            + os.path.basename(path)
+                            + " (delai " + str(delay)
+                            + "s, err: " + str(e) + ")",
+                            LOG_TAG, Qgis.Info
+                        )
+                        QCoreApplication.processEvents()
+                        time.sleep(delay)
+            return False
+
+        # Ordre de priorite : .dbf en PREMIER (pire lock),
+        # .shp en DERNIER
+        ext_order = {
+            ".dbf": 0, ".shx": 1, ".prj": 2,
+            ".cpg": 3, ".shp": 99,
+        }
+
+        def _copy_priority(fname):
+            ext = os.path.splitext(fname)[1].lower()
+            return ext_order.get(ext, 50)
+
+        # Total etapes : nb_couches + nb_fichiers + nb_couches
+        # + nb_fichiers
+        total_files = sum(
+            len(job["matching_files"]) for job in jobs
+        )
+        total_steps = (
+            len(jobs) + total_files
+            + len(jobs) + total_files
+        )
+
+        progress = QProgressDialog(
+            "Preparation...",
+            "Annuler",
+            0, max(total_steps, 1),
+            self.iface.mainWindow()
+        )
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setWindowTitle(
+            "Renommage APS \u2192 APD"
+        )
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QCoreApplication.processEvents()
+
+        step = 0
+
+        QgsMessageLog.logMessage(
+            "=== Demarrage copy+reload+delete ("
+            + str(len(jobs)) + " job(s), "
+            + str(total_files) + " fichier(s)) ===",
+            LOG_TAG, Qgis.Info
+        )
+
+        # Phase B : snapshot pour rollback + retrait des couches
+        # avec deleteLater() pour vraiment liberer les
+        # QgsVectorLayer cote Qt.
+        removed_layers_info = []
+        cancelled_in_b = False
+        for job in jobs:
+            if progress.wasCanceled():
+                cancelled_in_b = True
+                break
+            removed_layers_info.append({
+                "source": job["old_source_path"],
+                "name": job["old_name"],
+            })
+            layer_obj = job["layer"]
+            progress.setLabelText(
+                "Phase 1/4 : Retrait de la couche \u2014 "
+                + job["old_name"]
+            )
+            QgsProject.instance().removeMapLayer(
+                layer_obj.id()
+            )
+            try:
+                layer_obj.deleteLater()
+            except Exception:
+                pass
+            job["layer"] = None  # libere la ref Python
+
+            step += 1
+            progress.setValue(step)
+            QCoreApplication.processEvents()
+
+        # Forcer la liberation des locks GDAL/OGR (Windows)
+        QCoreApplication.processEvents()
+        gc.collect()
+        time.sleep(0.3)
+
+        if cancelled_in_b:
+            # Rollback minimal : re-ajouter les couches deja
+            # retirees (fichiers source intacts)
+            QgsMessageLog.logMessage(
+                "=== Annulation utilisateur en phase B ===",
+                LOG_TAG, Qgis.Warning
+            )
+            for info in removed_layers_info:
+                old_layer = QgsVectorLayer(
+                    info["source"], info["name"], "ogr"
+                )
+                if old_layer.isValid():
+                    QgsProject.instance().addMapLayer(
+                        old_layer
+                    )
+            progress.close()
+            QMessageBox.warning(
+                self.iface.mainWindow(),
+                "Renommage APS \u2192 APD",
+                "Operation annulee. Les couches ont ete "
+                "remises dans QGIS."
+            )
+            return
+
+        # Retry delays pour les copies (doit rarement servir
+        # car copy = read-only sur source)
+        copy_retry_delays = [0.3, 0.5, 1.0, 2.0, 3.0]
+
+        # Phase C : COPY toutes les destinations
+        all_copies = []  # [(src, dst)] cumulatif pour rollback
+        copy_failed = False
+        copy_cancelled = False
+        failed_prefix = None
+        failed_folder = None
+        failed_file = None
+        last_err = None
+
+        for job in jobs:
+            if progress.wasCanceled():
+                copy_cancelled = True
+                break
+            folder = job["folder"]
+            old_prefix = job["old_prefix"]
+            new_prefix = job["new_prefix"]
+            matching_files = sorted(
+                job["matching_files"],
+                key=_copy_priority,
+            )
+
+            # Nettoyage prealable : supprimer les residus dst
+            for src_name in matching_files:
+                ext = src_name[len(old_prefix):]
+                dst_path = os.path.join(
+                    folder, new_prefix + ext
+                )
+                if os.path.exists(dst_path):
+                    try:
+                        os.remove(dst_path)
+                        QgsMessageLog.logMessage(
+                            "Residu supprime : " + dst_path,
+                            LOG_TAG, Qgis.Info
+                        )
+                    except OSError as e:
+                        QgsMessageLog.logMessage(
+                            "Residu non supprimable "
+                            + dst_path + " : " + str(e),
+                            LOG_TAG, Qgis.Warning
+                        )
+
+            # Copy chaque fichier avec retry
+            job_copies = []
+            job_success = True
+            for src_name in matching_files:
+                if progress.wasCanceled():
+                    copy_cancelled = True
+                    job_success = False
+                    break
+
+                progress.setLabelText(
+                    "Phase 2/4 : Copie \u2014 " + src_name
+                )
+                QCoreApplication.processEvents()
+
+                ext = src_name[len(old_prefix):]
+                src_path = os.path.join(folder, src_name)
+                dst_path = os.path.join(
+                    folder, new_prefix + ext
+                )
+                if not os.path.exists(src_path):
+                    step += 1
+                    progress.setValue(step)
+                    continue
+
+                file_copied = False
+                for attempt in range(
+                    len(copy_retry_delays) + 1
+                ):
+                    try:
+                        shutil.copy2(src_path, dst_path)
+                        job_copies.append(
+                            (src_path, dst_path)
+                        )
+                        file_copied = True
+                        QgsMessageLog.logMessage(
+                            "Copy OK : " + src_name
+                            + " -> " + new_prefix + ext,
+                            LOG_TAG, Qgis.Info
+                        )
+                        break
+                    except OSError as e:
+                        last_err = e
+                        if attempt < len(copy_retry_delays):
+                            delay = copy_retry_delays[
+                                attempt
+                            ]
+                            QgsMessageLog.logMessage(
+                                "Copy retry "
+                                + str(attempt + 2) + "/"
+                                + str(
+                                    len(copy_retry_delays)
+                                    + 1
+                                )
+                                + " sur " + src_name
+                                + " (delai " + str(delay)
+                                + "s, err: " + str(e)
+                                + ")",
+                                LOG_TAG, Qgis.Warning
+                            )
+                            gc.collect()
+                            QCoreApplication.processEvents()
+                            time.sleep(delay)
+
+                step += 1
+                progress.setValue(step)
+                QCoreApplication.processEvents()
+
+                if not file_copied:
+                    QgsMessageLog.logMessage(
+                        "Copy ECHEC sur " + src_name
+                        + " : " + str(last_err),
+                        LOG_TAG, Qgis.Critical
+                    )
+                    failed_file = src_name
+                    job_success = False
+                    break
+
+            if not job_success:
+                # Rollback local : supprimer les copies
+                for src_path, dst_path in reversed(
+                    job_copies
+                ):
+                    try:
+                        if os.path.exists(dst_path):
+                            os.remove(dst_path)
+                    except OSError:
+                        pass
+                if not copy_cancelled:
+                    copy_failed = True
+                    failed_prefix = old_prefix
+                    failed_folder = folder
+                break
+
+            all_copies.extend(job_copies)
+            QgsMessageLog.logMessage(
+                "Job copy OK : " + old_prefix
+                + " -> " + new_prefix,
+                LOG_TAG, Qgis.Info
+            )
+
+        if copy_failed or copy_cancelled:
+            # ROLLBACK GLOBAL : supprimer toutes les copies +
+            # re-ajouter les anciennes couches (fichiers
+            # sources intacts car non modifies par la copie).
+            QgsMessageLog.logMessage(
+                "=== Rollback (suppression des copies) ===",
+                LOG_TAG, Qgis.Warning
+            )
+            for src_path, dst_path in reversed(all_copies):
+                try:
+                    if os.path.exists(dst_path):
+                        os.remove(dst_path)
+                except OSError as e:
+                    QgsMessageLog.logMessage(
+                        "Rollback echec pour " + dst_path
+                        + " : " + str(e),
+                        LOG_TAG, Qgis.Critical
+                    )
+
+            for info in removed_layers_info:
+                old_layer = QgsVectorLayer(
+                    info["source"], info["name"], "ogr"
+                )
+                if old_layer.isValid():
+                    QgsProject.instance().addMapLayer(
+                        old_layer
+                    )
+
+            progress.close()
+
+            if copy_cancelled:
+                QMessageBox.warning(
+                    self.iface.mainWindow(),
+                    "Renommage APS \u2192 APD",
+                    "Operation annulee. Les copies "
+                    "partielles ont ete supprimees et "
+                    "les couches remises dans QGIS."
+                )
+            else:
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Renommage APS \u2192 APD - Echec copy",
+                    "Echec lors de la copie de "
+                    + str(failed_file)
+                    + "\n(dans " + str(failed_folder)
+                    + ") :\n" + str(last_err) + "\n\n"
+                    "Rollback effectue : aucune "
+                    "modification sur les fichiers, les "
+                    "couches ont ete remises dans QGIS.\n\n"
+                    "Voir le Journal des messages "
+                    "(onglet '" + LOG_TAG + "')."
+                )
+            return
+
+        # Phase D : recharger les couches sur les nouveaux chemins
+        for job in jobs:
+            progress.setLabelText(
+                "Phase 3/4 : Rechargement \u2014 "
+                + job["new_name"]
+            )
+            QCoreApplication.processEvents()
+
+            new_layer = QgsVectorLayer(
+                job["new_source_path"],
+                job["new_name"], "ogr"
+            )
+            if new_layer.isValid():
+                QgsProject.instance().addMapLayer(new_layer)
+                nb_renomme += 1
+                QgsMessageLog.logMessage(
+                    "Couche rechargee : " + job["new_name"],
+                    LOG_TAG, Qgis.Info
+                )
+            else:
+                erreurs.append(
+                    "Couche " + job["new_name"]
+                    + " copiee sur disque mais impossible "
+                    "a recharger dans QGIS"
+                )
+
+            step += 1
+            progress.setValue(step)
+            QCoreApplication.processEvents()
+
+        # Tuer les geometries fantomes APS sur le canvas
+        try:
+            self.iface.mapCanvas().refreshAllLayers()
+        except Exception:
+            pass
+
+        # Phase E : DELETE des anciens fichiers (best-effort)
+        # via force_release_and_delete qui purge le cache GDAL
+        # avant chaque tentative. Couvre TOUS les compagnons
+        # presents sur disque : .shp, .dbf, .shx, .prj, .cpg,
+        # .qix, .sbn, .sbx, .shp.xml, etc.
+        orphans = []
+
+        for job in jobs:
+            folder = job["folder"]
+            old_prefix = job["old_prefix"]
+            matching_files = sorted(
+                job["matching_files"],
+                key=_copy_priority,
+            )
+            for src_name in matching_files:
+                src_path = os.path.join(folder, src_name)
+
+                progress.setLabelText(
+                    "Phase 4/4 : Suppression \u2014 "
+                    + src_name
+                )
+                QCoreApplication.processEvents()
+
+                if not os.path.exists(src_path):
+                    step += 1
+                    progress.setValue(step)
+                    continue
+
+                ok = force_release_and_delete(
+                    src_path, retries=6
+                )
+                if ok:
+                    QgsMessageLog.logMessage(
+                        "Delete OK : " + src_name,
+                        LOG_TAG, Qgis.Info
+                    )
+                else:
+                    orphans.append(src_path)
+                    QgsMessageLog.logMessage(
+                        "Delete ECHEC (orphelin) : "
+                        + src_path,
+                        LOG_TAG, Qgis.Warning
+                    )
+
+                step += 1
+                progress.setValue(step)
+                QCoreApplication.processEvents()
+
+        progress.setValue(total_steps)
+        progress.close()
+
+        # 5. Message de resultat
+        msg = (str(nb_renomme)
+               + " couche(s) renommee(s) avec succes.")
+        if orphans:
+            msg += (
+                "\n\nATTENTION : "
+                + str(len(orphans))
+                + " ancien(s) fichier(s) n'ont pas pu "
+                "etre supprimes (orphelins) :\n"
+                + "\n".join(orphans)
+                + "\n\nLes couches APD fonctionnent "
+                "normalement. Vous pouvez supprimer "
+                "manuellement ces fichiers plus tard "
+                "(redemarrer QGIS peut aider)."
+            )
+        if erreurs:
+            msg += "\n\nErreurs :\n" + "\n".join(erreurs)
+        QMessageBox.information(
+            self.iface.mainWindow(),
+            "Renommage APS \u2192 APD",
+            msg
         )
