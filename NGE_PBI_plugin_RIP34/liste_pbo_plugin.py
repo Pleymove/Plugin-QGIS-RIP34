@@ -1183,16 +1183,40 @@ class ListePBOPlugin:
         time.sleep(0.3)
 
         # Phase C : rename filesystem avec rollback global
+        # Retry agressif avec backoff exponentiel : Windows
+        # Search Indexer / Defender lockent et delockent les
+        # .dbf en permanence (race condition apres probe OK).
+        retry_delays = [
+            0.3, 0.3, 0.5, 0.5, 1.0, 1.0, 1.0,
+            2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 5.0, 5.0,
+        ]
+        max_attempts = len(retry_delays)  # 15
+
+        # Ordre de priorite : .dbf en PREMIER (pire lock),
+        # .shp en DERNIER (le moins locke)
+        ext_order = {
+            ".dbf": 0, ".shx": 1, ".prj": 2,
+            ".cpg": 3, ".shp": 99,
+        }
+
+        def _rename_priority(fname):
+            ext = os.path.splitext(fname)[1].lower()
+            return ext_order.get(ext, 50)
+
         all_renames = []  # [(src, dst)] cumulatif
         rename_failed = False
         failed_prefix = None
+        failed_folder = None
         last_err = None
 
         for job in jobs:
             folder = job["folder"]
             old_prefix = job["old_prefix"]
             new_prefix = job["new_prefix"]
-            matching_files = job["matching_files"]
+            matching_files = sorted(
+                job["matching_files"],
+                key=_rename_priority,
+            )
 
             # Nettoyage prealable : supprimer les residus
             # destination (tests precedents)
@@ -1215,10 +1239,11 @@ class ListePBOPlugin:
                             LOG_TAG, Qgis.Warning
                         )
 
-            # Rename atomique du job avec retry 3x
+            # Rename atomique du job avec retry max_attempts
             job_renames = []
             job_success = False
-            for attempt in range(3):
+            failed_file = None
+            for attempt in range(max_attempts):
                 try:
                     for src_name in matching_files:
                         ext = src_name[len(old_prefix):]
@@ -1228,6 +1253,7 @@ class ListePBOPlugin:
                         dst_path = os.path.join(
                             folder, new_prefix + ext
                         )
+                        failed_file = src_name
                         if os.path.exists(src_path):
                             os.rename(src_path, dst_path)
                             job_renames.append(
@@ -1251,18 +1277,29 @@ class ListePBOPlugin:
                         except OSError:
                             pass
                     job_renames = []
-                    if attempt < 2:
+                    if attempt < max_attempts - 1:
+                        delay = retry_delays[attempt]
+                        QgsMessageLog.logMessage(
+                            "Retry "
+                            + str(attempt + 2) + "/"
+                            + str(max_attempts) + " sur "
+                            + str(failed_file)
+                            + " (delai " + str(delay)
+                            + "s, err: " + str(e) + ")",
+                            LOG_TAG, Qgis.Info
+                        )
                         gc.collect()
                         QgsApplication.processEvents()
-                        time.sleep(0.5)
+                        time.sleep(delay)
 
             if not job_success:
                 rename_failed = True
                 failed_prefix = old_prefix
+                failed_folder = folder
                 QgsMessageLog.logMessage(
                     "Echec rename " + old_prefix
-                    + " apres 3 tentatives : "
-                    + str(last_err),
+                    + " apres " + str(max_attempts)
+                    + " tentatives : " + str(last_err),
                     LOG_TAG, Qgis.Critical
                 )
                 break
@@ -1308,13 +1345,30 @@ class ListePBOPlugin:
                 self.iface.mainWindow(),
                 "Renommage APS \u2192 APD - Echec",
                 "Echec du rename pour " + str(failed_prefix)
-                + " apres 3 tentatives :\n"
+                + " apres " + str(max_attempts)
+                + " tentatives (~30s d'attente) :\n"
                 + str(last_err) + "\n\n"
                 "Rollback effectue : les fichiers et les "
                 "couches QGIS ont ete restaures dans leur "
                 "etat d'origine.\n\n"
+                "DIAGNOSTIC : le dossier\n   "
+                + str(failed_folder) + "\n"
+                "est probablement indexe par Windows Search "
+                "ou scanne en continu par l'antivirus "
+                "(Windows Defender), qui re-lockent les "
+                ".dbf entre chaque tentative.\n\n"
+                "SOLUTIONS :\n"
+                "1. Desactiver l'indexation sur ce dossier :\n"
+                "   clic droit dossier \u2192 Proprietes "
+                "\u2192 Avance \u2192 decocher 'autoriser "
+                "l'indexation du contenu'.\n"
+                "2. OU deplacer le projet hors de "
+                "Downloads / OneDrive vers un chemin type\n"
+                "   C:\\GIS\\ ou C:\\Projets\\ "
+                "ou les scans sont moins frequents.\n\n"
                 "Voir le Journal des messages "
-                "(onglet '" + LOG_TAG + "') pour le detail."
+                "(onglet '" + LOG_TAG + "') pour le detail "
+                "des tentatives."
             )
             return
 
