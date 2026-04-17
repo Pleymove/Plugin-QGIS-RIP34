@@ -4,7 +4,8 @@ from qgis.PyQt.QtGui import QIcon, QCursor
 from qgis.core import (QgsProject, Qgis, QgsVectorLayer,
                        QgsSpatialIndex, QgsFeatureRequest,
                        QgsGeometry, QgsFeature,
-                       QgsCoordinateTransform)
+                       QgsCoordinateTransform,
+                       QgsApplication)
 from .liste_pbo_dialog import ListePBODialog
 from .fibres_utiles_dialog import FibresUtilesDialog
 from .ref_prop_dialog import RefPropDialog
@@ -13,6 +14,8 @@ import os
 import math
 import re
 import shutil
+import gc
+import time
 
 
 class ListePBOPlugin:
@@ -1031,17 +1034,19 @@ class ListePBOPlugin:
             ".cpg", ".qix", ".qpj", ".sbn", ".sbx",
         ]
 
+        # Phase A : classer et valider chaque couche
+        # - non-shapefile / nom fichier inchange : renommage QGIS seul
+        # - shapefile a renommer : collecter le job
+        jobs = []
         for item in chosen:
             layer = item["layer"]
             old_name = item["old_name"]
             new_name = item["new_name"]
 
-            # Extraire le chemin source (avant '|' eventuel)
             source = layer.source().split("|")[0].strip()
             is_shp = source.lower().endswith(".shp")
 
             if not is_shp:
-                # Format non-shapefile : renommage QGIS seul
                 layer.setName(new_name)
                 nb_ok += 1
                 continue
@@ -1056,8 +1061,6 @@ class ListePBOPlugin:
             )
 
             if old_stem == new_stem:
-                # Le nom de fichier ne contient pas -APS-
-                # (nom QGIS seul change)
                 layer.setName(new_name)
                 nb_ok += 1
                 continue
@@ -1075,47 +1078,84 @@ class ListePBOPlugin:
                 nb_err += 1
                 continue
 
-            # Renommer tous les fichiers associes
-            try:
-                for ext in SHP_EXTS:
-                    old_f = os.path.join(
-                        dir_path, old_stem + ext
-                    )
-                    if os.path.exists(old_f):
-                        shutil.move(
-                            old_f,
-                            os.path.join(
-                                dir_path, new_stem + ext
-                            )
+            jobs.append({
+                "layer_id": layer.id(),
+                "old_name": old_name,
+                "new_name": new_name,
+                "dir_path": dir_path,
+                "old_stem": old_stem,
+                "new_stem": new_stem,
+                "new_shp": new_shp,
+            })
+
+        # Phase B : retirer toutes les couches des shapefiles
+        # a renommer pour liberer les locks (critique sur Windows
+        # ou removeMapLayer ne libere pas immediatement le handle).
+        for job in jobs:
+            QgsProject.instance().removeMapLayer(
+                job["layer_id"]
+            )
+        # Casser les references Python restantes vers les layers
+        for item in chosen:
+            item["layer"] = None
+        gc.collect()
+        QgsApplication.processEvents()
+        time.sleep(0.2)
+
+        # Phase C : renommer les fichiers disque avec retry puis
+        # recharger la couche avec le nouveau chemin.
+        for job in jobs:
+            last_err = None
+            success = False
+            for attempt in range(3):
+                try:
+                    for ext in SHP_EXTS:
+                        old_f = os.path.join(
+                            job["dir_path"],
+                            job["old_stem"] + ext
                         )
-            except OSError as e:
+                        if os.path.exists(old_f):
+                            shutil.move(
+                                old_f,
+                                os.path.join(
+                                    job["dir_path"],
+                                    job["new_stem"] + ext
+                                )
+                            )
+                    success = True
+                    break
+                except OSError as e:
+                    last_err = e
+                    if attempt < 2:
+                        time.sleep(0.5)
+                        gc.collect()
+                        QgsApplication.processEvents()
+
+            if not success:
                 QMessageBox.warning(
                     self.iface.mainWindow(),
                     "Renommage APS \u2192 APD",
-                    "Erreur fichier pour '"
-                    + old_name + "' :\n" + str(e)
+                    "Fichier utilise par un autre processus,\n"
+                    "fermez les autres applications qui "
+                    "pourraient utiliser ce shapefile.\n\n"
+                    "Couche : " + job["old_name"]
+                    + "\n\nDetail : " + str(last_err)
                 )
                 nb_err += 1
                 continue
 
-            # Supprimer l'ancienne couche et recharger
-            QgsProject.instance().removeMapLayer(
-                layer.id()
-            )
             new_layer = QgsVectorLayer(
-                new_shp, new_name, "ogr"
+                job["new_shp"], job["new_name"], "ogr"
             )
             if new_layer.isValid():
-                QgsProject.instance().addMapLayer(
-                    new_layer
-                )
+                QgsProject.instance().addMapLayer(new_layer)
                 nb_ok += 1
             else:
                 QMessageBox.warning(
                     self.iface.mainWindow(),
                     "Renommage APS \u2192 APD",
                     "Couche rechargee invalide : "
-                    + new_name
+                    + job["new_name"]
                 )
                 nb_err += 1
 
