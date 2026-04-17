@@ -5,7 +5,7 @@ from qgis.core import (QgsProject, Qgis, QgsVectorLayer,
                        QgsSpatialIndex, QgsFeatureRequest,
                        QgsGeometry, QgsFeature,
                        QgsCoordinateTransform,
-                       QgsVectorFileWriter)
+                       QgsApplication)
 from .liste_pbo_dialog import ListePBODialog
 from .fibres_utiles_dialog import FibresUtilesDialog
 from .ref_prop_dialog import RefPropDialog
@@ -13,6 +13,8 @@ from .renommage_apd_dialog import RenommageAPDDialog
 import os
 import math
 import re
+import gc
+import time
 
 
 class ListePBOPlugin:
@@ -1023,9 +1025,10 @@ class ListePBOPlugin:
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # 4. Appliquer le renommage
-        nb_ok = 0
+        # Phase A : validation / collecte des jobs shapefile
+        nb_renomme = 0
         erreurs = []
+        jobs = []
 
         for item in chosen:
             layer = item["layer"]
@@ -1038,7 +1041,7 @@ class ListePBOPlugin:
             if not is_shp:
                 # Format non-shapefile : renommage QGIS seul
                 layer.setName(new_name)
-                nb_ok += 1
+                nb_renomme += 1
                 continue
 
             dir_path = os.path.dirname(source)
@@ -1053,39 +1056,146 @@ class ListePBOPlugin:
             if old_stem == new_stem:
                 # Nom de fichier sans -APS- : renommage QGIS seul
                 layer.setName(new_name)
-                nb_ok += 1
+                nb_renomme += 1
                 continue
 
             new_shp = os.path.join(
                 dir_path, new_stem + ".shp"
             )
-            if os.path.exists(new_shp):
+            jobs.append({
+                "layer": layer,
+                "new_name": new_name,
+                "old_source_path": source,
+                "new_source_path": new_shp,
+            })
+
+        # Phase B : retirer TOUTES les couches shapefile du projet
+        # d'un coup pour liberer les locks GDAL/OGR
+        for item in jobs:
+            layer_id = item["layer"].id()
+            QgsProject.instance().removeMapLayer(layer_id)
+            item["layer"] = None  # libere la ref Python
+
+        # Forcer la liberation des locks (Windows)
+        gc.collect()
+        QgsApplication.processEvents()
+        time.sleep(0.3)
+
+        # Phase C : rename filesystem batch par job
+        for item in jobs:
+            old_shp = item["old_source_path"]
+            new_shp = item["new_source_path"]
+            new_name = item["new_name"]
+
+            folder = os.path.dirname(old_shp)
+            old_prefix = os.path.splitext(
+                os.path.basename(old_shp)
+            )[0]
+            new_prefix = os.path.splitext(
+                os.path.basename(new_shp)
+            )[0]
+
+            # Scan dossier : tous les fichiers avec basename
+            # exact (toutes extensions compagnons confondues)
+            try:
+                matching_files = [
+                    f for f in os.listdir(folder)
+                    if os.path.splitext(f)[0] == old_prefix
+                ]
+            except OSError as e:
                 erreurs.append(
-                    "Fichier deja existant, couche ignoree : "
-                    + new_shp
+                    "Erreur lecture dossier pour "
+                    + old_prefix + " : " + str(e)
                 )
                 continue
 
-            # QgsVectorFileWriter.rename() gere atomiquement
-            # .shp + .shx + .dbf + .prj + .cpg + .qix + .qpj
-            # ET les locks GDAL/OGR sur Windows.
-            # La source de la couche est mise a jour en place :
-            # pas besoin de removeMapLayer / addMapLayer.
-            result, err_msg = QgsVectorFileWriter.rename(
-                layer, new_shp
+            if not matching_files:
+                erreurs.append(
+                    "Aucun fichier trouve pour " + old_prefix
+                )
+                continue
+
+            # Nettoyage prealable : supprimer les residus
+            # destination (tests precedents)
+            for src_name in matching_files:
+                ext = src_name[len(old_prefix):]
+                dst_path = os.path.join(
+                    folder, new_prefix + ext
+                )
+                if os.path.exists(dst_path):
+                    try:
+                        os.remove(dst_path)
+                    except OSError as e:
+                        erreurs.append(
+                            "Impossible de supprimer residu "
+                            + dst_path + " : " + str(e)
+                        )
+
+            # Rename atomique avec retry 3x + rollback
+            files_renamed = []
+            success = False
+            last_err = None
+            for attempt in range(3):
+                try:
+                    for src_name in matching_files:
+                        ext = src_name[len(old_prefix):]
+                        src_path = os.path.join(
+                            folder, src_name
+                        )
+                        dst_path = os.path.join(
+                            folder, new_prefix + ext
+                        )
+                        if os.path.exists(src_path):
+                            os.rename(src_path, dst_path)
+                            files_renamed.append(
+                                (src_path, dst_path)
+                            )
+                    success = True
+                    break
+                except OSError as e:
+                    last_err = e
+                    # Rollback des fichiers deja renommes
+                    for src_path, dst_path in reversed(
+                        files_renamed
+                    ):
+                        try:
+                            if (os.path.exists(dst_path)
+                                    and not os.path.exists(
+                                        src_path)):
+                                os.rename(dst_path, src_path)
+                        except OSError:
+                            pass
+                    files_renamed = []
+                    if attempt < 2:
+                        gc.collect()
+                        QgsApplication.processEvents()
+                        time.sleep(0.5)
+
+            if not success:
+                erreurs.append(
+                    "Echec rename " + old_prefix
+                    + " apres 3 tentatives : "
+                    + str(last_err)
+                )
+                continue
+
+            # Phase D : recharger la couche avec le nouveau chemin
+            new_layer = QgsVectorLayer(
+                new_shp, new_name, "ogr"
             )
-            if result != QgsVectorFileWriter.NoError:
+            if new_layer.isValid():
+                QgsProject.instance().addMapLayer(new_layer)
+                nb_renomme += 1
+            else:
                 erreurs.append(
-                    "Echec renommage " + old_name
-                    + " : " + err_msg
+                    "Couche " + new_name
+                    + " renommee sur disque mais "
+                    "impossible a recharger dans QGIS"
                 )
-                continue
-
-            layer.setName(new_name)
-            nb_ok += 1
 
         # 5. Message de resultat
-        msg = str(nb_ok) + " couche(s) renommee(s)."
+        msg = (str(nb_renomme)
+               + " couche(s) renommee(s) avec succes.")
         if erreurs:
             msg += "\n\nErreurs :\n" + "\n".join(erreurs)
         QMessageBox.information(
