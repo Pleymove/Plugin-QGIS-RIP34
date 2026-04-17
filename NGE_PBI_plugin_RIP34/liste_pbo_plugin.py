@@ -5,7 +5,7 @@ from qgis.core import (QgsProject, Qgis, QgsVectorLayer,
                        QgsSpatialIndex, QgsFeatureRequest,
                        QgsGeometry, QgsFeature,
                        QgsCoordinateTransform,
-                       QgsApplication)
+                       QgsVectorFileWriter)
 from .liste_pbo_dialog import ListePBODialog
 from .fibres_utiles_dialog import FibresUtilesDialog
 from .ref_prop_dialog import RefPropDialog
@@ -13,9 +13,6 @@ from .renommage_apd_dialog import RenommageAPDDialog
 import os
 import math
 import re
-import shutil
-import gc
-import time
 
 
 class ListePBOPlugin:
@@ -1028,16 +1025,8 @@ class ListePBOPlugin:
 
         # 4. Appliquer le renommage
         nb_ok = 0
-        nb_err = 0
-        SHP_EXTS = [
-            ".shp", ".shx", ".dbf", ".prj",
-            ".cpg", ".qix", ".qpj", ".sbn", ".sbx",
-        ]
+        erreurs = []
 
-        # Phase A : classer et valider chaque couche
-        # - non-shapefile / nom fichier inchange : renommage QGIS seul
-        # - shapefile a renommer : collecter le job
-        jobs = []
         for item in chosen:
             layer = item["layer"]
             old_name = item["old_name"]
@@ -1047,6 +1036,7 @@ class ListePBOPlugin:
             is_shp = source.lower().endswith(".shp")
 
             if not is_shp:
+                # Format non-shapefile : renommage QGIS seul
                 layer.setName(new_name)
                 nb_ok += 1
                 continue
@@ -1061,6 +1051,7 @@ class ListePBOPlugin:
             )
 
             if old_stem == new_stem:
+                # Nom de fichier sans -APS- : renommage QGIS seul
                 layer.setName(new_name)
                 nb_ok += 1
                 continue
@@ -1069,106 +1060,36 @@ class ListePBOPlugin:
                 dir_path, new_stem + ".shp"
             )
             if os.path.exists(new_shp):
-                QMessageBox.warning(
-                    self.iface.mainWindow(),
-                    "Renommage APS \u2192 APD",
-                    "Fichier deja existant, couche ignoree :\n"
+                erreurs.append(
+                    "Fichier deja existant, couche ignoree : "
                     + new_shp
                 )
-                nb_err += 1
                 continue
 
-            jobs.append({
-                "layer_id": layer.id(),
-                "old_name": old_name,
-                "new_name": new_name,
-                "dir_path": dir_path,
-                "old_stem": old_stem,
-                "new_stem": new_stem,
-                "new_shp": new_shp,
-            })
-
-        # Phase B : retirer toutes les couches des shapefiles
-        # a renommer pour liberer les locks (critique sur Windows
-        # ou removeMapLayer ne libere pas immediatement le handle).
-        for job in jobs:
-            QgsProject.instance().removeMapLayer(
-                job["layer_id"]
+            # QgsVectorFileWriter.rename() gere atomiquement
+            # .shp + .shx + .dbf + .prj + .cpg + .qix + .qpj
+            # ET les locks GDAL/OGR sur Windows.
+            # La source de la couche est mise a jour en place :
+            # pas besoin de removeMapLayer / addMapLayer.
+            result, err_msg = QgsVectorFileWriter.rename(
+                layer, new_shp
             )
-        # Casser les references Python restantes vers les layers
-        for item in chosen:
-            item["layer"] = None
-        gc.collect()
-        QgsApplication.processEvents()
-        time.sleep(0.2)
-
-        # Phase C : renommer les fichiers disque avec retry puis
-        # recharger la couche avec le nouveau chemin.
-        for job in jobs:
-            last_err = None
-            success = False
-            for attempt in range(3):
-                try:
-                    for ext in SHP_EXTS:
-                        old_f = os.path.join(
-                            job["dir_path"],
-                            job["old_stem"] + ext
-                        )
-                        if os.path.exists(old_f):
-                            shutil.move(
-                                old_f,
-                                os.path.join(
-                                    job["dir_path"],
-                                    job["new_stem"] + ext
-                                )
-                            )
-                    success = True
-                    break
-                except OSError as e:
-                    last_err = e
-                    if attempt < 2:
-                        time.sleep(0.5)
-                        gc.collect()
-                        QgsApplication.processEvents()
-
-            if not success:
-                QMessageBox.warning(
-                    self.iface.mainWindow(),
-                    "Renommage APS \u2192 APD",
-                    "Fichier utilise par un autre processus,\n"
-                    "fermez les autres applications qui "
-                    "pourraient utiliser ce shapefile.\n\n"
-                    "Couche : " + job["old_name"]
-                    + "\n\nDetail : " + str(last_err)
+            if result != QgsVectorFileWriter.NoError:
+                erreurs.append(
+                    "Echec renommage " + old_name
+                    + " : " + err_msg
                 )
-                nb_err += 1
                 continue
 
-            new_layer = QgsVectorLayer(
-                job["new_shp"], job["new_name"], "ogr"
-            )
-            if new_layer.isValid():
-                QgsProject.instance().addMapLayer(new_layer)
-                nb_ok += 1
-            else:
-                QMessageBox.warning(
-                    self.iface.mainWindow(),
-                    "Renommage APS \u2192 APD",
-                    "Couche rechargee invalide : "
-                    + job["new_name"]
-                )
-                nb_err += 1
+            layer.setName(new_name)
+            nb_ok += 1
 
         # 5. Message de resultat
         msg = str(nb_ok) + " couche(s) renommee(s)."
-        if nb_err:
-            msg += " " + str(nb_err) + " erreur(s)."
-        self.iface.messageBar().pushMessage(
+        if erreurs:
+            msg += "\n\nErreurs :\n" + "\n".join(erreurs)
+        QMessageBox.information(
+            self.iface.mainWindow(),
             "Renommage APS \u2192 APD",
-            msg,
-            level=(
-                Qgis.Success if nb_ok > 0
-                else Qgis.Warning
-            ),
-            duration=10
+            msg
         )
