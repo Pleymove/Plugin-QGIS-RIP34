@@ -15,6 +15,7 @@ import math
 import re
 import gc
 import time
+import shutil
 
 
 class ListePBOPlugin:
@@ -1096,74 +1097,15 @@ class ListePBOPlugin:
                 "matching_files": matching_files,
             })
 
-        # Phase PROBE : tester les locks AVANT toute modif QGIS
-        # (ouverture r+b qui echoue sur Windows si locked)
-        QgsMessageLog.logMessage(
-            "=== Probe lock detection (" + str(len(jobs))
-            + " job(s)) ===",
-            LOG_TAG, Qgis.Info
-        )
-
-        locked_files = []
-        for job in jobs:
-            QgsMessageLog.logMessage(
-                "Probe " + job["old_prefix"] + " : "
-                + str(len(job["matching_files"]))
-                + " fichier(s) compagnon(s)",
-                LOG_TAG, Qgis.Info
-            )
-            for fname in job["matching_files"]:
-                fpath = os.path.join(job["folder"], fname)
-                try:
-                    with open(fpath, "r+b"):
-                        pass
-                    QgsMessageLog.logMessage(
-                        "  [OK] " + fname,
-                        LOG_TAG, Qgis.Info
-                    )
-                except (OSError, PermissionError) as e:
-                    QgsMessageLog.logMessage(
-                        "  [LOCKED] " + fname
-                        + " (" + str(e) + ")",
-                        LOG_TAG, Qgis.Warning
-                    )
-                    locked_files.append(fpath)
-
-        if locked_files:
-            QgsMessageLog.logMessage(
-                "=== Probe ECHEC : "
-                + str(len(locked_files))
-                + " fichier(s) verrouille(s) - abort ===",
-                LOG_TAG, Qgis.Critical
-            )
-            QMessageBox.critical(
-                self.iface.mainWindow(),
-                "Renommage APS \u2192 APD - "
-                "Fichiers verrouilles",
-                "Impossible de renommer : certains fichiers "
-                "sont verrouilles par un autre processus.\n\n"
-                "Fichier(s) concerne(s) :\n"
-                + "\n".join(locked_files)
-                + "\n\nCauses frequentes :\n"
-                "- Explorer Windows ouvert sur le dossier\n"
-                "- Antivirus qui scanne les .dbf\n"
-                "- Windows Search Indexer\n"
-                "- Fichier .dbf ouvert dans Excel / "
-                "LibreOffice\n\n"
-                "Solutions :\n"
-                "- Fermer l'Explorer Windows\n"
-                "- Desactiver temporairement l'indexation "
-                "du dossier\n"
-                "- Attendre 10-20 secondes puis reessayer\n\n"
-                "Aucune modification n'a ete effectuee. "
-                "Les couches restent intactes dans QGIS."
-            )
-            return
-
-        QgsMessageLog.logMessage(
-            "=== Probe OK - demarrage du rename ===",
-            LOG_TAG, Qgis.Info
-        )
+        # STRATEGIE : COPY + RELOAD + DELETE best-effort.
+        # os.rename echoue systematiquement sur les .dbf a cause
+        # des handles GDAL/OGR garde en cache meme apres
+        # removeMapLayer. shutil.copy2 ne requiert qu'un acces
+        # LECTURE PARTAGEE sur la source, ce qui reste autorise
+        # meme si QGIS / Defender / indexer ont un handle ouvert.
+        # On copie vers le nouveau nom, on recharge la couche sur
+        # le nouveau chemin, puis on supprime les anciens fichiers
+        # en best-effort (si delete echoue -> orphelins tolerables).
 
         # Phase B : snapshot pour rollback + retrait des couches
         removed_layers_info = []
@@ -1177,36 +1119,37 @@ class ListePBOPlugin:
             )
             job["layer"] = None  # libere la ref Python
 
-        # Forcer la liberation des locks GDAL/OGR (Windows)
         gc.collect()
         QgsApplication.processEvents()
         time.sleep(0.3)
 
-        # Phase C : rename filesystem avec rollback global
-        # Retry agressif avec backoff exponentiel : Windows
-        # Search Indexer / Defender lockent et delockent les
-        # .dbf en permanence (race condition apres probe OK).
-        retry_delays = [
-            0.3, 0.3, 0.5, 0.5, 1.0, 1.0, 1.0,
-            2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 5.0, 5.0,
-        ]
-        max_attempts = len(retry_delays)  # 15
+        QgsMessageLog.logMessage(
+            "=== Demarrage copy+reload+delete ("
+            + str(len(jobs)) + " job(s)) ===",
+            LOG_TAG, Qgis.Info
+        )
 
         # Ordre de priorite : .dbf en PREMIER (pire lock),
-        # .shp en DERNIER (le moins locke)
+        # .shp en DERNIER
         ext_order = {
             ".dbf": 0, ".shx": 1, ".prj": 2,
             ".cpg": 3, ".shp": 99,
         }
 
-        def _rename_priority(fname):
+        def _copy_priority(fname):
             ext = os.path.splitext(fname)[1].lower()
             return ext_order.get(ext, 50)
 
-        all_renames = []  # [(src, dst)] cumulatif
-        rename_failed = False
+        # Retry delays pour les copies (doit rarement servir car
+        # copy = read-only sur source)
+        copy_retry_delays = [0.3, 0.5, 1.0, 2.0, 3.0]
+
+        # Phase C : COPY toutes les destinations
+        all_copies = []  # [(src, dst)] cumulatif pour rollback
+        copy_failed = False
         failed_prefix = None
         failed_folder = None
+        failed_file = None
         last_err = None
 
         for job in jobs:
@@ -1215,11 +1158,10 @@ class ListePBOPlugin:
             new_prefix = job["new_prefix"]
             matching_files = sorted(
                 job["matching_files"],
-                key=_rename_priority,
+                key=_copy_priority,
             )
 
-            # Nettoyage prealable : supprimer les residus
-            # destination (tests precedents)
+            # Nettoyage prealable : supprimer les residus dst
             for src_name in matching_files:
                 ext = src_name[len(old_prefix):]
                 dst_path = os.path.join(
@@ -1234,96 +1176,106 @@ class ListePBOPlugin:
                         )
                     except OSError as e:
                         QgsMessageLog.logMessage(
-                            "Impossible de supprimer residu "
+                            "Residu non supprimable "
                             + dst_path + " : " + str(e),
                             LOG_TAG, Qgis.Warning
                         )
 
-            # Rename atomique du job avec retry max_attempts
-            job_renames = []
-            job_success = False
-            failed_file = None
-            for attempt in range(max_attempts):
-                try:
-                    for src_name in matching_files:
-                        ext = src_name[len(old_prefix):]
-                        src_path = os.path.join(
-                            folder, src_name
+            # Copy chaque fichier avec retry
+            job_copies = []
+            job_success = True
+            for src_name in matching_files:
+                ext = src_name[len(old_prefix):]
+                src_path = os.path.join(folder, src_name)
+                dst_path = os.path.join(
+                    folder, new_prefix + ext
+                )
+                if not os.path.exists(src_path):
+                    continue
+
+                file_copied = False
+                for attempt in range(
+                    len(copy_retry_delays) + 1
+                ):
+                    try:
+                        shutil.copy2(src_path, dst_path)
+                        job_copies.append(
+                            (src_path, dst_path)
                         )
-                        dst_path = os.path.join(
-                            folder, new_prefix + ext
-                        )
-                        failed_file = src_name
-                        if os.path.exists(src_path):
-                            os.rename(src_path, dst_path)
-                            job_renames.append(
-                                (src_path, dst_path)
-                            )
-                    job_success = True
-                    break
-                except OSError as e:
-                    last_err = e
-                    # Rollback local du job
-                    for src_path, dst_path in reversed(
-                        job_renames
-                    ):
-                        try:
-                            if (os.path.exists(dst_path)
-                                    and not os.path.exists(
-                                        src_path)):
-                                os.rename(
-                                    dst_path, src_path
-                                )
-                        except OSError:
-                            pass
-                    job_renames = []
-                    if attempt < max_attempts - 1:
-                        delay = retry_delays[attempt]
+                        file_copied = True
                         QgsMessageLog.logMessage(
-                            "Retry "
-                            + str(attempt + 2) + "/"
-                            + str(max_attempts) + " sur "
-                            + str(failed_file)
-                            + " (delai " + str(delay)
-                            + "s, err: " + str(e) + ")",
+                            "Copy OK : " + src_name
+                            + " -> " + new_prefix + ext,
                             LOG_TAG, Qgis.Info
                         )
-                        gc.collect()
-                        QgsApplication.processEvents()
-                        time.sleep(delay)
+                        break
+                    except OSError as e:
+                        last_err = e
+                        if attempt < len(copy_retry_delays):
+                            delay = copy_retry_delays[
+                                attempt
+                            ]
+                            QgsMessageLog.logMessage(
+                                "Copy retry "
+                                + str(attempt + 2) + "/"
+                                + str(
+                                    len(copy_retry_delays)
+                                    + 1
+                                )
+                                + " sur " + src_name
+                                + " (delai " + str(delay)
+                                + "s, err: " + str(e)
+                                + ")",
+                                LOG_TAG, Qgis.Warning
+                            )
+                            gc.collect()
+                            QgsApplication.processEvents()
+                            time.sleep(delay)
+
+                if not file_copied:
+                    QgsMessageLog.logMessage(
+                        "Copy ECHEC sur " + src_name
+                        + " : " + str(last_err),
+                        LOG_TAG, Qgis.Critical
+                    )
+                    failed_file = src_name
+                    job_success = False
+                    break
 
             if not job_success:
-                rename_failed = True
+                # Rollback local : supprimer les copies
+                for src_path, dst_path in reversed(
+                    job_copies
+                ):
+                    try:
+                        if os.path.exists(dst_path):
+                            os.remove(dst_path)
+                    except OSError:
+                        pass
+                copy_failed = True
                 failed_prefix = old_prefix
                 failed_folder = folder
-                QgsMessageLog.logMessage(
-                    "Echec rename " + old_prefix
-                    + " apres " + str(max_attempts)
-                    + " tentatives : " + str(last_err),
-                    LOG_TAG, Qgis.Critical
-                )
                 break
 
-            all_renames.extend(job_renames)
+            all_copies.extend(job_copies)
             QgsMessageLog.logMessage(
-                "Rename OK : " + old_prefix
+                "Job copy OK : " + old_prefix
                 + " -> " + new_prefix,
                 LOG_TAG, Qgis.Info
             )
 
-        if rename_failed:
-            # ROLLBACK GLOBAL : renommer a l'envers +
-            # re-ajouter les anciennes couches
+        if copy_failed:
+            # ROLLBACK GLOBAL : supprimer toutes les copies +
+            # re-ajouter les anciennes couches (fichiers
+            # sources intacts car non modifies par la copie).
             QgsMessageLog.logMessage(
-                "=== Rollback global en cours ===",
+                "=== Rollback (suppression des copies) ===",
                 LOG_TAG, Qgis.Warning
             )
-            for src_path, dst_path in reversed(all_renames):
+            for src_path, dst_path in reversed(all_copies):
                 try:
-                    if (os.path.exists(dst_path)
-                            and not os.path.exists(
-                                src_path)):
-                        os.rename(dst_path, src_path)
+                    if os.path.exists(dst_path):
+                        os.remove(dst_path)
                 except OSError as e:
                     QgsMessageLog.logMessage(
                         "Rollback echec pour " + dst_path
@@ -1331,7 +1283,6 @@ class ListePBOPlugin:
                         LOG_TAG, Qgis.Critical
                     )
 
-            # Re-ajouter les couches avec leurs anciens chemins
             for info in removed_layers_info:
                 old_layer = QgsVectorLayer(
                     info["source"], info["name"], "ogr"
@@ -1343,36 +1294,20 @@ class ListePBOPlugin:
 
             QMessageBox.critical(
                 self.iface.mainWindow(),
-                "Renommage APS \u2192 APD - Echec",
-                "Echec du rename pour " + str(failed_prefix)
-                + " apres " + str(max_attempts)
-                + " tentatives (~30s d'attente) :\n"
+                "Renommage APS \u2192 APD - Echec copy",
+                "Echec lors de la copie de "
+                + str(failed_file)
+                + "\n(dans " + str(failed_folder) + ") :\n"
                 + str(last_err) + "\n\n"
-                "Rollback effectue : les fichiers et les "
-                "couches QGIS ont ete restaures dans leur "
-                "etat d'origine.\n\n"
-                "DIAGNOSTIC : le dossier\n   "
-                + str(failed_folder) + "\n"
-                "est probablement indexe par Windows Search "
-                "ou scanne en continu par l'antivirus "
-                "(Windows Defender), qui re-lockent les "
-                ".dbf entre chaque tentative.\n\n"
-                "SOLUTIONS :\n"
-                "1. Desactiver l'indexation sur ce dossier :\n"
-                "   clic droit dossier \u2192 Proprietes "
-                "\u2192 Avance \u2192 decocher 'autoriser "
-                "l'indexation du contenu'.\n"
-                "2. OU deplacer le projet hors de "
-                "Downloads / OneDrive vers un chemin type\n"
-                "   C:\\GIS\\ ou C:\\Projets\\ "
-                "ou les scans sont moins frequents.\n\n"
+                "Rollback effectue : aucune modification "
+                "sur les fichiers, les couches ont ete "
+                "remises dans QGIS.\n\n"
                 "Voir le Journal des messages "
-                "(onglet '" + LOG_TAG + "') pour le detail "
-                "des tentatives."
+                "(onglet '" + LOG_TAG + "')."
             )
             return
 
-        # Phase D : recharger les couches avec les nouveaux chemins
+        # Phase D : recharger les couches sur les nouveaux chemins
         for job in jobs:
             new_layer = QgsVectorLayer(
                 job["new_source_path"],
@@ -1388,13 +1323,86 @@ class ListePBOPlugin:
             else:
                 erreurs.append(
                     "Couche " + job["new_name"]
-                    + " renommee sur disque mais "
-                    "impossible a recharger dans QGIS"
+                    + " copiee sur disque mais impossible "
+                    "a recharger dans QGIS"
                 )
+
+        # Phase E : DELETE des anciens fichiers (best-effort).
+        # Si delete echoue -> orphelins tolerables (la couche
+        # APD fonctionne deja). Retry moderate.
+        delete_retry_delays = [0.3, 0.5, 1.0, 2.0, 3.0, 5.0]
+        orphans = []
+
+        for job in jobs:
+            folder = job["folder"]
+            old_prefix = job["old_prefix"]
+            matching_files = sorted(
+                job["matching_files"],
+                key=_copy_priority,
+            )
+            for src_name in matching_files:
+                src_path = os.path.join(folder, src_name)
+                if not os.path.exists(src_path):
+                    continue
+
+                deleted = False
+                for attempt in range(
+                    len(delete_retry_delays) + 1
+                ):
+                    try:
+                        os.remove(src_path)
+                        deleted = True
+                        QgsMessageLog.logMessage(
+                            "Delete OK : " + src_name,
+                            LOG_TAG, Qgis.Info
+                        )
+                        break
+                    except OSError as e:
+                        if attempt < len(
+                            delete_retry_delays
+                        ):
+                            delay = delete_retry_delays[
+                                attempt
+                            ]
+                            QgsMessageLog.logMessage(
+                                "Delete retry "
+                                + str(attempt + 2) + "/"
+                                + str(
+                                    len(delete_retry_delays)
+                                    + 1
+                                )
+                                + " sur " + src_name
+                                + " (delai " + str(delay)
+                                + "s)",
+                                LOG_TAG, Qgis.Info
+                            )
+                            gc.collect()
+                            QgsApplication.processEvents()
+                            time.sleep(delay)
+
+                if not deleted:
+                    orphans.append(src_path)
+                    QgsMessageLog.logMessage(
+                        "Delete ECHEC (orphelin) : "
+                        + src_path,
+                        LOG_TAG, Qgis.Warning
+                    )
 
         # 5. Message de resultat
         msg = (str(nb_renomme)
                + " couche(s) renommee(s) avec succes.")
+        if orphans:
+            msg += (
+                "\n\nATTENTION : "
+                + str(len(orphans))
+                + " ancien(s) fichier(s) n'ont pas pu "
+                "etre supprimes (orphelins) :\n"
+                + "\n".join(orphans)
+                + "\n\nLes couches APD fonctionnent "
+                "normalement. Vous pouvez supprimer "
+                "manuellement ces fichiers plus tard "
+                "(redemarrer QGIS peut aider)."
+            )
         if erreurs:
             msg += "\n\nErreurs :\n" + "\n".join(erreurs)
         QMessageBox.information(
