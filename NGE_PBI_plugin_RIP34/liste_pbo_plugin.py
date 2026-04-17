@@ -5,7 +5,7 @@ from qgis.core import (QgsProject, Qgis, QgsVectorLayer,
                        QgsSpatialIndex, QgsFeatureRequest,
                        QgsGeometry, QgsFeature,
                        QgsCoordinateTransform,
-                       QgsApplication)
+                       QgsApplication, QgsMessageLog)
 from .liste_pbo_dialog import ListePBODialog
 from .fibres_utiles_dialog import FibresUtilesDialog
 from .ref_prop_dialog import RefPropDialog
@@ -1025,6 +1025,8 @@ class ListePBOPlugin:
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        LOG_TAG = "Renommage APD"
+
         # Phase A : validation / collecte des jobs shapefile
         nb_renomme = 0
         erreurs = []
@@ -1062,58 +1064,135 @@ class ListePBOPlugin:
             new_shp = os.path.join(
                 dir_path, new_stem + ".shp"
             )
-            jobs.append({
-                "layer": layer,
-                "new_name": new_name,
-                "old_source_path": source,
-                "new_source_path": new_shp,
-            })
 
-        # Phase B : retirer TOUTES les couches shapefile du projet
-        # d'un coup pour liberer les locks GDAL/OGR
-        for item in jobs:
-            layer_id = item["layer"].id()
-            QgsProject.instance().removeMapLayer(layer_id)
-            item["layer"] = None  # libere la ref Python
-
-        # Forcer la liberation des locks (Windows)
-        gc.collect()
-        QgsApplication.processEvents()
-        time.sleep(0.3)
-
-        # Phase C : rename filesystem batch par job
-        for item in jobs:
-            old_shp = item["old_source_path"]
-            new_shp = item["new_source_path"]
-            new_name = item["new_name"]
-
-            folder = os.path.dirname(old_shp)
-            old_prefix = os.path.splitext(
-                os.path.basename(old_shp)
-            )[0]
-            new_prefix = os.path.splitext(
-                os.path.basename(new_shp)
-            )[0]
-
-            # Scan dossier : tous les fichiers avec basename
-            # exact (toutes extensions compagnons confondues)
+            # Scan dossier : tous les fichiers avec basename exact
             try:
                 matching_files = [
-                    f for f in os.listdir(folder)
-                    if os.path.splitext(f)[0] == old_prefix
+                    f for f in os.listdir(dir_path)
+                    if os.path.splitext(f)[0] == old_stem
                 ]
             except OSError as e:
                 erreurs.append(
                     "Erreur lecture dossier pour "
-                    + old_prefix + " : " + str(e)
+                    + old_stem + " : " + str(e)
                 )
                 continue
 
             if not matching_files:
                 erreurs.append(
-                    "Aucun fichier trouve pour " + old_prefix
+                    "Aucun fichier trouve pour " + old_stem
                 )
                 continue
+
+            jobs.append({
+                "layer": layer,
+                "old_name": old_name,
+                "new_name": new_name,
+                "old_source_path": source,
+                "new_source_path": new_shp,
+                "folder": dir_path,
+                "old_prefix": old_stem,
+                "new_prefix": new_stem,
+                "matching_files": matching_files,
+            })
+
+        # Phase PROBE : tester les locks AVANT toute modif QGIS
+        # (ouverture r+b qui echoue sur Windows si locked)
+        QgsMessageLog.logMessage(
+            "=== Probe lock detection (" + str(len(jobs))
+            + " job(s)) ===",
+            LOG_TAG, Qgis.Info
+        )
+
+        locked_files = []
+        for job in jobs:
+            QgsMessageLog.logMessage(
+                "Probe " + job["old_prefix"] + " : "
+                + str(len(job["matching_files"]))
+                + " fichier(s) compagnon(s)",
+                LOG_TAG, Qgis.Info
+            )
+            for fname in job["matching_files"]:
+                fpath = os.path.join(job["folder"], fname)
+                try:
+                    with open(fpath, "r+b"):
+                        pass
+                    QgsMessageLog.logMessage(
+                        "  [OK] " + fname,
+                        LOG_TAG, Qgis.Info
+                    )
+                except (OSError, PermissionError) as e:
+                    QgsMessageLog.logMessage(
+                        "  [LOCKED] " + fname
+                        + " (" + str(e) + ")",
+                        LOG_TAG, Qgis.Warning
+                    )
+                    locked_files.append(fpath)
+
+        if locked_files:
+            QgsMessageLog.logMessage(
+                "=== Probe ECHEC : "
+                + str(len(locked_files))
+                + " fichier(s) verrouille(s) - abort ===",
+                LOG_TAG, Qgis.Critical
+            )
+            QMessageBox.critical(
+                self.iface.mainWindow(),
+                "Renommage APS \u2192 APD - "
+                "Fichiers verrouilles",
+                "Impossible de renommer : certains fichiers "
+                "sont verrouilles par un autre processus.\n\n"
+                "Fichier(s) concerne(s) :\n"
+                + "\n".join(locked_files)
+                + "\n\nCauses frequentes :\n"
+                "- Explorer Windows ouvert sur le dossier\n"
+                "- Antivirus qui scanne les .dbf\n"
+                "- Windows Search Indexer\n"
+                "- Fichier .dbf ouvert dans Excel / "
+                "LibreOffice\n\n"
+                "Solutions :\n"
+                "- Fermer l'Explorer Windows\n"
+                "- Desactiver temporairement l'indexation "
+                "du dossier\n"
+                "- Attendre 10-20 secondes puis reessayer\n\n"
+                "Aucune modification n'a ete effectuee. "
+                "Les couches restent intactes dans QGIS."
+            )
+            return
+
+        QgsMessageLog.logMessage(
+            "=== Probe OK - demarrage du rename ===",
+            LOG_TAG, Qgis.Info
+        )
+
+        # Phase B : snapshot pour rollback + retrait des couches
+        removed_layers_info = []
+        for job in jobs:
+            removed_layers_info.append({
+                "source": job["old_source_path"],
+                "name": job["old_name"],
+            })
+            QgsProject.instance().removeMapLayer(
+                job["layer"].id()
+            )
+            job["layer"] = None  # libere la ref Python
+
+        # Forcer la liberation des locks GDAL/OGR (Windows)
+        gc.collect()
+        QgsApplication.processEvents()
+        time.sleep(0.3)
+
+        # Phase C : rename filesystem avec rollback global
+        all_renames = []  # [(src, dst)] cumulatif
+        rename_failed = False
+        failed_prefix = None
+        last_err = None
+
+        for job in jobs:
+            folder = job["folder"]
+            old_prefix = job["old_prefix"]
+            new_prefix = job["new_prefix"]
+            matching_files = job["matching_files"]
 
             # Nettoyage prealable : supprimer les residus
             # destination (tests precedents)
@@ -1125,16 +1204,20 @@ class ListePBOPlugin:
                 if os.path.exists(dst_path):
                     try:
                         os.remove(dst_path)
+                        QgsMessageLog.logMessage(
+                            "Residu supprime : " + dst_path,
+                            LOG_TAG, Qgis.Info
+                        )
                     except OSError as e:
-                        erreurs.append(
+                        QgsMessageLog.logMessage(
                             "Impossible de supprimer residu "
-                            + dst_path + " : " + str(e)
+                            + dst_path + " : " + str(e),
+                            LOG_TAG, Qgis.Warning
                         )
 
-            # Rename atomique avec retry 3x + rollback
-            files_renamed = []
-            success = False
-            last_err = None
+            # Rename atomique du job avec retry 3x
+            job_renames = []
+            job_success = False
             for attempt in range(3):
                 try:
                     for src_name in matching_files:
@@ -1147,48 +1230,110 @@ class ListePBOPlugin:
                         )
                         if os.path.exists(src_path):
                             os.rename(src_path, dst_path)
-                            files_renamed.append(
+                            job_renames.append(
                                 (src_path, dst_path)
                             )
-                    success = True
+                    job_success = True
                     break
                 except OSError as e:
                     last_err = e
-                    # Rollback des fichiers deja renommes
+                    # Rollback local du job
                     for src_path, dst_path in reversed(
-                        files_renamed
+                        job_renames
                     ):
                         try:
                             if (os.path.exists(dst_path)
                                     and not os.path.exists(
                                         src_path)):
-                                os.rename(dst_path, src_path)
+                                os.rename(
+                                    dst_path, src_path
+                                )
                         except OSError:
                             pass
-                    files_renamed = []
+                    job_renames = []
                     if attempt < 2:
                         gc.collect()
                         QgsApplication.processEvents()
                         time.sleep(0.5)
 
-            if not success:
-                erreurs.append(
+            if not job_success:
+                rename_failed = True
+                failed_prefix = old_prefix
+                QgsMessageLog.logMessage(
                     "Echec rename " + old_prefix
                     + " apres 3 tentatives : "
-                    + str(last_err)
+                    + str(last_err),
+                    LOG_TAG, Qgis.Critical
                 )
-                continue
+                break
 
-            # Phase D : recharger la couche avec le nouveau chemin
+            all_renames.extend(job_renames)
+            QgsMessageLog.logMessage(
+                "Rename OK : " + old_prefix
+                + " -> " + new_prefix,
+                LOG_TAG, Qgis.Info
+            )
+
+        if rename_failed:
+            # ROLLBACK GLOBAL : renommer a l'envers +
+            # re-ajouter les anciennes couches
+            QgsMessageLog.logMessage(
+                "=== Rollback global en cours ===",
+                LOG_TAG, Qgis.Warning
+            )
+            for src_path, dst_path in reversed(all_renames):
+                try:
+                    if (os.path.exists(dst_path)
+                            and not os.path.exists(
+                                src_path)):
+                        os.rename(dst_path, src_path)
+                except OSError as e:
+                    QgsMessageLog.logMessage(
+                        "Rollback echec pour " + dst_path
+                        + " : " + str(e),
+                        LOG_TAG, Qgis.Critical
+                    )
+
+            # Re-ajouter les couches avec leurs anciens chemins
+            for info in removed_layers_info:
+                old_layer = QgsVectorLayer(
+                    info["source"], info["name"], "ogr"
+                )
+                if old_layer.isValid():
+                    QgsProject.instance().addMapLayer(
+                        old_layer
+                    )
+
+            QMessageBox.critical(
+                self.iface.mainWindow(),
+                "Renommage APS \u2192 APD - Echec",
+                "Echec du rename pour " + str(failed_prefix)
+                + " apres 3 tentatives :\n"
+                + str(last_err) + "\n\n"
+                "Rollback effectue : les fichiers et les "
+                "couches QGIS ont ete restaures dans leur "
+                "etat d'origine.\n\n"
+                "Voir le Journal des messages "
+                "(onglet '" + LOG_TAG + "') pour le detail."
+            )
+            return
+
+        # Phase D : recharger les couches avec les nouveaux chemins
+        for job in jobs:
             new_layer = QgsVectorLayer(
-                new_shp, new_name, "ogr"
+                job["new_source_path"],
+                job["new_name"], "ogr"
             )
             if new_layer.isValid():
                 QgsProject.instance().addMapLayer(new_layer)
                 nb_renomme += 1
+                QgsMessageLog.logMessage(
+                    "Couche rechargee : " + job["new_name"],
+                    LOG_TAG, Qgis.Info
+                )
             else:
                 erreurs.append(
-                    "Couche " + new_name
+                    "Couche " + job["new_name"]
                     + " renommee sur disque mais "
                     "impossible a recharger dans QGIS"
                 )
