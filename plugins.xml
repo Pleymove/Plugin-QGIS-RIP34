@@ -1,15 +1,15 @@
 <?xml version="1.0"?>
 <plugins>
-<pyqgis_plugin name="NGE_PBI_plugin_RIP34" version="4.3">
-<description>Plugin couteau suisse FTTH RIP34 : generation LISTE DES PBO + calcul fibres utiles avec MAJ automatique de la table attributaire CB</description>
-<about>Plugin v3 avec affichage hierarchique. Detecte le BPE de depart via la couche CB.</about>
-<version>4.3</version>
+<pyqgis_plugin name="NGE_PBI_plugin_RIP34" version="4.4">
+<description>Plugin couteau suisse FTTH RIP34 : 4 outils — LISTE DES PBO, Fibres Utiles, REF PROP, Renommage APS vers APD.</description>
+<about>Plugin FTTH RIP34 regroupant 4 outils : (1) LISTE DES PBO — genere LISTE_DES_PBO.txt avec PBO + BPE de depart, hierarchie via la couche CB (cables DISTRIBUTION) ; (2) Fibres Utiles — calcul des fibres utiles par cable avec MAJ automatique de la table attributaire CB ; (3) REF PROP — affectation automatique de la reference proprietaire sur les poteaux ; (4) Renommage APS vers APD — renommage en masse des couches shapefile du phase APS vers APD avec barre de progression, purge du cache GDAL et rollback transactionnel.</about>
+<version>4.4</version>
 <qgis_minimum_version>3.0</qgis_minimum_version>
 <qgis_maximum_version>4.99</qgis_maximum_version>
 <author_name>Pierre Birau / NGE Energie et Solutions</author_name>
 <email>pbirau@nge-es.fr</email>
-<download_url>https://github.com/Pleymove/Plugin-QGIS-RIP34/releases/download/v4.3/NGE_PBI_plugin_RIP34.zip</download_url>
+<download_url>https://github.com/Pleymove/Plugin-QGIS-RIP34/releases/download/v4.4/NGE_PBI_plugin_RIP34.zip</download_url>
 <file_name>NGE_PBI_plugin_RIP34.zip</file_name>
-<tags>ftth,bpe,pbo,rip34,nge</tags>
+<tags>ftth,bpe,pbo,rip34,nge,fibres,ref-prop,renommage,aps,apd,shapefile</tags>
 </pyqgis_plugin>
 </plugins>
